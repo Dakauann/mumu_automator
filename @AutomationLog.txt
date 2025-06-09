@@ -1,0 +1,2 @@
+2025-06-05 23:04:31.558 main.py[89] interact_with_elements -> Find Control Timeout(10s): {ControlType: CheckBoxControl}
+2025-06-05 23:05:23.331 main.py[110] interact_with_elements -> Find Control Timeout(10s): {ControlType: CheckBoxControl}

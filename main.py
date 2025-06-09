@@ -1,0 +1,709 @@
+import os
+import time
+from pywinauto import Application
+from pywinauto.mouse import click, move
+from pywinauto.timings import Timings
+from pywinauto.keyboard import send_keys
+import random
+import string
+import enum
+
+# Increase default timeout to ensure controls are ready
+Timings.window_find_timeout = 5.0
+
+# create a enum, witch is, FROM_START, TO_END, FROM_START, TO_MID, FROM_MID, TO_START
+class SelectionPoints(enum.Enum):
+    FROM_START = 1
+    TO_END = 2
+    FROM_MID = 3
+    TO_START = 4
+    TO_MID = 5
+
+def main():
+    mumu_path = r"D:\Program Files\Netease\MuMuPlayerGlobal-12.0\shell\MuMuMultiPlayer.exe"
+    vm_base_name = "ROM_"
+    vm_names = padronize_vm_names(vm_base_name)
+
+    # Try to close MuMu Multi-Instance if already running
+    try:
+        app = Application(backend="uia").connect(title="MuMu Multi-instance 12", timeout=5)
+        print("MuMu Multi-Instance is already running. Closing it first...")
+        app.window(title="MuMu Multi-instance 12").close()
+        time.sleep(2)  # Wait for the process to close
+    except Exception:
+        print("MuMu Multi-Instance is not running or could not connect.")
+
+    # Start MuMu Multi-Instance
+    print("Attempting to launch the program...")
+    try:
+        os.startfile(mumu_path)
+        print("Program launched successfully. Waiting 5 seconds for it to start...")
+        time.sleep(5)
+        app = Application(backend="uia").connect(title="MuMu Multi-instance 12", timeout=5)
+        print("MuMu Multi-Instance window is now open.")
+    except FileNotFoundError:
+        print(f"Error: The MuMu Multi-Instance executable was not found at {mumu_path}.")
+        return
+    except Exception as e:
+        print(f"Error launching MuMu Multi-Instance: {str(e)}")
+        return
+
+    main_window = app.window(title="MuMu Multi-instance 12")
+    main_window.set_focus()
+    
+    # moving the mouse to the center of the main window
+    main_window_rect = main_window.rectangle()
+    center_x = main_window_rect.left + main_window_rect.width() // 2
+    center_y = main_window_rect.top + main_window_rect.height() // 2
+    move(coords=(center_x, center_y))
+
+    list_elements_on_window(main_window)
+    instances_range = list(range(1, 10))
+    manage_instances_searchbar(vm_names, instances_range, main_window, )
+    # interact_with_elements(main_window)
+    # find_and_inspect_toolbar(main_window)
+
+def manage_instances_searchbar(vm_names, instances_range, main_window, start_point=0, end_point=None):
+    """
+    Start searching for instances in the search bar and select them.
+    Args:
+        vm_names: List of VM names to search for
+        instances_range: Range of instances to select
+        main_window: The main MuMu Multi-Instance window
+    """
+    search_bar = main_window.child_window(control_type="Edit", class_name="SearchEdit")
+    if not search_bar.exists(timeout=5):
+        print("Search bar not found.")
+        return
+
+    print("Starting instance selection process...")
+    for idx, vm_name in enumerate(vm_names):
+        if idx not in instances_range:
+            continue
+        
+        print(f"Searching for VM {idx}: {vm_name.upper()}")
+        try:
+            search_bar.set_focus()
+            time.sleep(0.2)
+            search_bar.set_edit_text("")  # Clear existing text
+            time.sleep(0.2)
+            send_keys(vm_name.upper(), with_spaces=True)
+            time.sleep(1)  # Allow time for search results to update
+        except Exception as e:
+            print(f"Error focusing or typing in search bar: {e}")
+            continue
+
+        # Click the first result in the list
+        instance_list = main_window.child_window(class_name="PlayerListWidget", control_type="List")
+       
+        if instance_list.exists():
+            instances = instance_list.children(control_type="ListItem")
+            if instances:
+                first_instance = instances[0]
+                row_rect = first_instance.rectangle()
+                if row_rect:
+                    # Calculate checkbox position (same logic as elsewhere)
+                    checkbox_x = row_rect.left + 36 + 15
+                    checkbox_y = row_rect.top + 28
+                    click(coords=(checkbox_x, checkbox_y))
+                    print(f"Clicked checkbox for instance: {vm_name}")
+                else:
+                    print(f"Could not get rectangle for first instance of VM: {vm_name}")
+            else:
+                print(f"No instances found for VM: {vm_name}")
+        else:
+            print("Instance list not found.")
+
+        time.sleep(1)  # Wait before next iteration
+
+def interact_with_elements(window):
+    # Re-query the instance list to ensure fresh data
+    instance_list = window.child_window(class_name="PlayerListWidget", control_type="List")
+    if not instance_list.exists(timeout=5):
+        print("Instance list not found.")
+        return
+
+    # Test scroll methods before proceeding
+    # test_scroll_methods_on_list(instance_list)
+
+    instances_to_select = list(range(1, 6 + 1))
+    action = "stop"
+
+    print("\nAnalyzing instance states before selection...")
+    # Re-fetch children to ensure fresh state
+    instances = instance_list.children(control_type="ListItem")
+    
+    print("=" * 80)
+    print("INSTANCE STATUS REPORT")
+    print("=" * 80)
+    
+    for index, instance_row in enumerate(instances):
+        # Skip non-ListItem controls
+        if instance_row.element_info.control_type != "ListItem":
+            continue
+
+        # Get initial bounding rectangle
+        row_rect = instance_row.rectangle()
+        if not row_rect:
+            print(f"No bounding rectangle found for instance at index {index}. Skipping.")
+            continue
+
+        # Analyze instance state
+        instance_info = analyze_instance_state(instance_row, index, window)
+        
+        print(f"Instance {index}:")
+        print(f"  Name: {instance_info['name']}")
+        print(f"  Running State: {instance_info['running_state']}")
+        print(f"  Checkbox State: {instance_info['checkbox_state']}")
+        print(f"  Rectangle: {row_rect}")
+        print("-" * 40)
+
+    print("\nNow selecting instances...")
+    
+    # Click and unclick the Select All checkbox
+    select_all_checkbox = window.child_window(control_type="CheckBox", title="Select All")
+    if select_all_checkbox.exists(timeout=2):
+        select_all_checkbox.click_input()
+        print("Clicked 'Select All' checkbox to select all instances.")
+        time.sleep(1)
+        select_all_checkbox.click_input()
+        print("Clicked 'Select All' checkbox again to unselect all instances.")
+        time.sleep(1)
+    else:
+        print("'Select All' checkbox not found.")
+        
+    # Re-fetch instances again for selection
+    instances = instance_list.children(control_type="ListItem")
+    for index, instance_row in enumerate(instances):
+        # Skip non-ListItem controls
+        if instance_row.element_info.control_type != "ListItem":
+            continue
+
+        # Get initial bounding rectangle
+        row_rect = instance_row.rectangle()
+        if not row_rect:
+            print(f"No bounding rectangle found for instance at index {index}. Skipping.")
+            continue
+
+        checkbox_x = row_rect.left + 36 + 15
+        checkbox_y = row_rect.top + 28
+
+        if index in instances_to_select:
+            # Re-query the specific list item to verify position
+            instance_list = window.child_window(class_name="PlayerListWidget", control_type="List")
+            instances = instance_list.children(control_type="ListItem")
+            if index >= len(instances):
+                print(f"Instance at index {index} no longer exists. Skipping.")
+                continue
+            instance_row = instances[index]
+            rechecked_rect = instance_row.rectangle()
+            if rechecked_rect == row_rect:
+                click(coords=(checkbox_x, checkbox_y))
+                print(f"Clicked verified checkbox position at ({checkbox_x}, {checkbox_y}) for instance at index {index}.")
+                
+                # Improved scrolling with multiple fallback methods
+                scroll_success = scroll_instance_list(instance_list, direction="down", amount=2)
+                if not scroll_success:
+                    print("Warning: Could not scroll the instance list. Continuing without scrolling.")
+                    
+            else:
+                print(f"Position mismatch for instance at index {index}. Skipping click.")
+
+    # Re-read screen to print instance statuses
+    print("\nRe-reading screen to verify instance statuses...")
+    instance_list = window.child_window(class_name="PlayerListWidget", control_type="List")
+    instances = instance_list.children(control_type="ListItem")
+    for index, instance_row in enumerate(instances):
+        if instance_row.element_info.control_type != "ListItem":
+            continue
+        row_rect = instance_row.rectangle()
+        print(f"Instance {index}: Rect: {row_rect}, Name: {instance_row.window_text() or '[No Name]'}")
+
+
+def padronize_vm_names(vm_name_prefix) -> list[str]:
+    """
+    Assigns a unique 7-character VM name (e.g., ROM_UGER7) to each MuMu instance,
+    updates the config, and returns the list of new names.
+    Ensures names do not repeat and are unique for each VM.
+    """
+    import os
+    import json
+
+    vm_dir = r"D:\Program Files\Netease\MuMuPlayerGlobal-12.0\vms"
+    vm_names = []
+    used_names = set()
+
+    def generate_unique_name():
+        while True:
+            suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+            name = f"{vm_name_prefix}{suffix}"
+            if name not in used_names:
+                used_names.add(name)
+                return name
+
+    for dir_name in os.listdir(vm_dir):
+        dir_path = os.path.join(vm_dir, dir_name)
+        if not os.path.isdir(dir_path):
+            continue
+
+        if not dir_name.startswith("MuMuPlayerGlobal-12.0-"):
+            continue
+
+        config_path = os.path.join(dir_path, "configs")
+        config_file = os.path.join(config_path, "extra_config.json")
+
+        if not os.path.exists(config_file):
+            print(f"No config file found: {config_file}")
+            continue
+
+        print(f"Found config file: {config_file}")
+
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+                new_player_name = generate_unique_name()
+                config_data["playerName"] = new_player_name
+                with open(config_file, 'w', encoding='utf-8') as f2:
+                    json.dump(config_data, f2, indent=2, ensure_ascii=False)
+                vm_names.append(new_player_name)
+                print(f"Updated and set unique VM name: {new_player_name}")
+        except json.JSONDecodeError as e:
+            print(f"Error reading JSON from {config_file}: {str(e)}")
+        except Exception as e:
+            print(f"Error updating {config_file}: {str(e)}")
+
+    return vm_names
+
+def get_detailed_scroll_info(control):
+    """
+    Get detailed scrolling information for a control
+    """
+    scroll_info = {
+        'is_scrollable': False,
+        'scroll_patterns': [],
+        'scroll_methods_available': [],
+        'scroll_bars': {'horizontal': False, 'vertical': False},
+        'error': None
+    }
+    
+    try:
+        # Check basic scrollable property
+        scroll_info['is_scrollable'] = control.is_scrollable()
+        
+        # Try to get UIA patterns for scrolling
+        try:
+            element = control.element_info
+            # Check for scroll pattern
+            if hasattr(element, 'get_current_pattern'):
+                try:
+                    scroll_pattern = element.get_current_pattern(10016)  # ScrollPattern ID
+                    if scroll_pattern:
+                        scroll_info['scroll_patterns'].append('ScrollPattern')
+                        # Get scroll properties
+                        try:
+                            h_scrollable = scroll_pattern.current_horizontally_scrollable
+                            v_scrollable = scroll_pattern.current_vertically_scrollable
+                            scroll_info['scroll_bars']['horizontal'] = h_scrollable
+                            scroll_info['scroll_bars']['vertical'] = v_scrollable
+                        except:
+                            pass
+                except:
+                    pass
+        except Exception as e:
+            scroll_info['error'] = f"Pattern check error: {str(e)}"
+        
+        # Check for scroll methods availability
+        scroll_methods = ['scroll', 'scroll_mouse', 'wheel_mouse_input']
+        for method in scroll_methods:
+            if hasattr(control, method):
+                scroll_info['scroll_methods_available'].append(method)
+        
+        # Look for scroll bar controls as children
+        try:
+            scrollbars = control.descendants(control_type="ScrollBar")
+            if scrollbars:
+                for sb in scrollbars:
+                    sb_name = sb.window_text() or sb.element_info.automation_id or "Unknown"
+                    orientation = "horizontal" if "horizontal" in sb_name.lower() else "vertical"
+                    scroll_info['scroll_bars'][orientation] = True
+        except:
+            pass
+            
+    except Exception as e:
+        scroll_info['error'] = f"General error: {str(e)}"
+    
+    return scroll_info
+
+def list_elements_on_window(window):
+    def print_detailed_tree(control, depth=0):
+        indent = "  " * depth
+        # Gather detailed properties
+        control_type = control.element_info.control_type or "[No ControlType]"
+        control_name = control.window_text() or "[No Name]"
+        automation_id = control.element_info.automation_id or "[No AutomationId]"
+        class_name = control.element_info.class_name or "[No ClassName]"
+        rectangle = control.rectangle() if control.rectangle() else "[No Rectangle]"
+        enabled = "Enabled" if control.is_enabled() else "Disabled"
+        visible = "Visible" if control.is_visible() else "Hidden"
+
+        # Print inline summary
+        print(f"{indent}- {control_type} | Name: '{control_name}' | Class: {class_name} | AutomationId: {automation_id} | Rect: {rectangle} | {enabled} | {visible}")
+
+        # Get detailed scroll information
+        scroll_info = get_detailed_scroll_info(control)
+        if scroll_info['is_scrollable']:
+            print(f"{indent}  [Scrollable] Patterns: {', '.join(scroll_info['scroll_patterns'])} | Methods: {', '.join(scroll_info['scroll_methods_available'])} | ScrollBars: H={scroll_info['scroll_bars']['horizontal']} V={scroll_info['scroll_bars']['vertical']}")
+        if scroll_info['error']:
+            print(f"{indent}  [Scroll Debug Error] {scroll_info['error']}")
+
+        # Special handling for List controls
+        if control_type == "List":
+            print(f"{indent}  *** LIST CONTROL DETECTED ***")
+            print(f"{indent}  List Items Count: {len(control.children())}")
+            try:
+                list_rect = control.rectangle()
+                if list_rect:
+                    print(f"{indent}  List Dimensions: {list_rect.width()}x{list_rect.height()}")
+                scrollbars = control.descendants(control_type="ScrollBar")
+                if scrollbars:
+                    print(f"{indent}  Found {len(scrollbars)} scroll bars in list")
+                    for i, sb in enumerate(scrollbars):
+                        sb_rect = sb.rectangle()
+                        sb_orientation = "Horizontal" if sb_rect and sb_rect.width() > sb_rect.height() else "Vertical"
+                        print(f"{indent}    ScrollBar {i+1}: {sb_orientation}, Rect: {sb_rect}")
+                else:
+                    print(f"{indent}  No scroll bars found in list")
+            except Exception as e:
+                print(f"{indent}  List analysis error: {str(e)}")
+
+        # Recursively process children
+        for child in control.children():
+            print_detailed_tree(child, depth + 1)
+
+    print("\nListing all controls in the MuMu Multi-Instance window with detailed properties:")
+    print_detailed_tree(window)
+
+def scroll_instance_list(instance_list, direction="down", amount=2):
+    """
+    Scroll the instance list by sending Page Up/Down keys after focusing the list.
+    Handles focus issues by attempting multiple focus methods and verifying focus.
+    Args:
+        instance_list: The list control to scroll
+        direction: "up" or "down"
+        amount: Number of Page Up/Down key presses (default 2 as per user observation)
+    """
+    print(f"Attempting to scroll instance list {direction}...")
+
+    # Helper function to verify if the control is focused
+    def is_control_focused(control):
+        try:
+            return control.has_focus() or control.is_active()
+        except Exception:
+            return False
+
+    # Attempt to focus the instance list
+    focused = False
+    try:
+        instance_list.set_focus()
+        time.sleep(0.2)  # Small delay to ensure focus is set
+        if is_control_focused(instance_list):
+            focused = True
+            print("Successfully focused instance list using set_focus()")
+        else:
+            print("set_focus() executed but control not focused")
+    except Exception as e:
+        print(f"set_focus() failed: {str(e)}")
+
+    # Fallback: Click the list to focus it
+    if not focused:
+        print("Attempting to focus by clicking the list...")
+        try:
+            list_rect = instance_list.rectangle()
+            if list_rect:
+                center_x = list_rect.left + list_rect.width() // 2
+                center_y = list_rect.top + list_rect.height() // 2
+                from pywinauto.mouse import click
+                click(coords=(center_x, center_y))
+                time.sleep(0.2)
+                if is_control_focused(instance_list):
+                    focused = True
+                    print(f"Successfully focused instance list by clicking at ({center_x}, {center_y})")
+                else:
+                    print("Click executed but control not focused")
+            else:
+                print("Could not get list rectangle for clicking")
+        except Exception as e:
+            print(f"Click to focus failed: {str(e)}")
+
+    # Final fallback: Try focusing the parent window
+    if not focused:
+        print("Attempting to focus parent window...")
+        try:
+            parent = instance_list.parent()
+            if parent and parent.is_enabled() and parent.is_visible():
+                parent.set_focus()
+                time.sleep(0.2)
+                if is_control_focused(parent) or is_control_focused(instance_list):
+                    focused = True
+                    print("Successfully focused parent window")
+                else:
+                    print("Parent window focus executed but control not focused")
+            else:
+                print("Parent window not valid for focusing")
+        except Exception as e:
+            print(f"Parent window focus failed: {str(e)}")
+
+    # Proceed with scrolling if focused, or attempt anyway with warning
+    if not focused:
+        print("Warning: Could not verify focus, attempting scroll anyway...")
+
+    try:
+        # Send Page Down or Page Up keys based on direction
+        key = "{PGDN}" if direction == "down" else "{PGUP}"
+        for _ in range(amount):
+            send_keys(key)
+            time.sleep(0.1)  # Small delay between key presses
+        print(f"Successfully scrolled using {key} key ({direction}, {amount} steps)")
+        time.sleep(0.5)  # Allow time for UI to update
+        return True
+    except Exception as e:
+        print(f"Page {direction} key scroll method failed: {str(e)}")
+
+    # Fallback: Try UIA Scroll Pattern
+    print("Falling back to UIA Scroll Pattern...")
+    try:
+        element = instance_list.element_info
+        scroll_pattern = element.get_current_pattern(10016)  # ScrollPattern ID
+        if scroll_pattern:
+            scroll_amount = 1 if direction == "down" else -1
+            for _ in range(amount):
+                scroll_pattern.scroll(0, scroll_amount)
+                time.sleep(0.1)
+            print(f"Successfully scrolled using UIA Scroll Pattern ({direction}, {amount} steps)")
+            return True
+        else:
+            print("UIA Scroll Pattern not available")
+    except Exception as e:
+        print(f"UIA Scroll Pattern failed: {str(e)}")
+
+    print("All scroll methods failed")
+    return False
+
+def find_and_inspect_toolbar(window):
+    """
+    Find the toolbar based on the node tree structure and inspect all its button children.
+    The toolbar is the bottom Group containing all the action buttons.
+    """
+    print("\nSearching for toolbar...")
+    
+    # Based on the node tree, the toolbar should be at the bottom of the window
+    # Look for Group elements that contain multiple Button children
+    all_groups = window.descendants(control_type="Group")
+    toolbar = None
+    
+    for group in all_groups:
+        rect = group.rectangle()
+        if not rect:
+            continue
+            
+        # The toolbar should be at the bottom of the window (Y coordinate around 804-860)
+        # and contain multiple buttons
+        if rect.top >= 800 and rect.bottom <= 900:
+            buttons = group.children(control_type="Button")
+            if len(buttons) >= 5:  # Should have multiple action buttons
+                toolbar = group
+                print(f"Found toolbar at rectangle: {rect}")
+                print(f"Toolbar contains {len(buttons)} buttons")
+                break
+    
+    if not toolbar:
+        print("Toolbar not found. Searching more broadly...")
+        # Alternative approach: look for any group with many buttons
+        for group in all_groups:
+            buttons = group.children(control_type="Button")
+            if len(buttons) >= 6:  # At least 6 buttons based on the node tree
+                toolbar = group
+                rect = group.rectangle()
+                print(f"Found toolbar candidate at rectangle: {rect}")
+                print(f"Toolbar contains {len(buttons)} buttons")
+                break
+    
+    if not toolbar:
+        print("Toolbar still not found. Let me try a different approach...")
+        # Try to find it by looking for specific button patterns
+        try:
+            # Look for the main container that holds all the content
+            main_container = window.child_window(class_name="QWidget")
+            if main_container.exists():
+                # Look for the last Group in the hierarchy which should be the toolbar
+                groups = main_container.descendants(control_type="Group")
+                for group in reversed(groups):  # Start from the last groups
+                    buttons = group.children(control_type="Button")
+                    if len(buttons) >= 5:
+                        toolbar = group
+                        rect = group.rectangle() if group.rectangle() else "Unknown"
+                        print(f"Found toolbar using alternative method at: {rect}")
+                        break
+        except Exception as e:
+            print(f"Error in alternative search: {e}")
+    
+    if not toolbar:
+        print("Toolbar could not be found using any method.")
+        return
+    
+    # Inspect all buttons in the toolbar
+    print(f"\nInspecting toolbar buttons...")
+    buttons = toolbar.children(control_type="Button")
+    
+    if not buttons:
+        print("No buttons found in toolbar.")
+        return
+    
+    print(f"Found {len(buttons)} buttons in toolbar:")
+    print("-" * 80)
+    
+    for idx, button in enumerate(buttons):
+        try:
+            button_rect = button.rectangle()
+            button_name = button.window_text() or f"Button_{idx}"
+            button_class = button.element_info.class_name or "[No ClassName]"
+            automation_id = button.element_info.automation_id or "[No AutomationId]"
+            is_enabled = button.is_enabled()
+            is_visible = button.is_visible()
+            
+            print(f"Button {idx + 1}:")
+            print(f"  Name: {button_name}")
+            print(f"  Class: {button_class}")
+            print(f"  AutomationId: {automation_id}")
+            print(f"  Rectangle: {button_rect}")
+            print(f"  Enabled: {'Yes' if is_enabled else 'No'}")
+            print(f"  Visible: {'Yes' if is_visible else 'No'}")
+            print(f"  Position: ({button_rect.left}, {button_rect.top})" if button_rect else "Unknown")
+            print(f"  Size: {button_rect.width()}x{button_rect.height()}" if button_rect else "Unknown")
+            print("-" * 40)
+        except Exception as e:
+            print(f"Error inspecting button {idx + 1}: {str(e)}")
+            
+def analyze_instance_state(instance_row, index, main_window):
+    """
+    Analyze the state of a MuMu instance to determine if it's running and if checkbox is checked.
+    
+    Args:
+        instance_row: The ListItem control representing the instance
+        index: The index of the instance
+        main_window: The main window to search for additional controls
+    
+    Returns:
+        dict: Contains 'name', 'running_state', and 'checkbox_state'
+    """
+    instance_info = {
+        'name': f'Instance_{index}',
+        'running_state': 'Unknown',
+        'checkbox_state': 'Unknown'
+    }
+    
+    try:
+        # Get all text elements within this instance row
+        text_elements = instance_row.descendants(control_type="Text")
+        
+        # Look for status text
+        status_found = False
+        for text_elem in text_elements:
+            text_content = text_elem.window_text()
+            if text_content:
+                # Check for running indicators
+                if "running" in text_content.lower():
+                    instance_info['running_state'] = 'Running'
+                    status_found = True
+                elif "not started" in text_content.lower():
+                    instance_info['running_state'] = 'Not Started'
+                    status_found = True
+                elif "stopped" in text_content.lower():
+                    instance_info['running_state'] = 'Stopped'
+                    status_found = True
+                
+                # Try to extract instance name
+                if any(keyword in text_content.upper() for keyword in ['ROM', 'MUMU', 'PLAYER', 'CLONE']):
+                    instance_info['name'] = text_content
+        
+        # Alternative method: Look for buttons within the instance row
+        if not status_found:
+            buttons = instance_row.descendants(control_type="Button")
+            for button in buttons:
+                button_rect = button.rectangle()
+                if button_rect:
+                    # Play buttons are typically on the right side of the row
+                    row_rect = instance_row.rectangle()
+                    if row_rect and button_rect.left > (row_rect.left + row_rect.width() * 0.7):
+                        # Check if button is enabled/disabled or has specific properties
+                        if button.is_enabled():
+                            # Try to determine button type by position or class
+                            button_class = button.element_info.class_name or ""
+                            automation_id = button.element_info.automation_id or ""
+                            
+                            # This is a heuristic - you might need to adjust based on actual button properties
+                            if "play" in button_class.lower() or "start" in button_class.lower():
+                                instance_info['running_state'] = 'Not Started'
+                            elif "stop" in button_class.lower() or "power" in button_class.lower():
+                                instance_info['running_state'] = 'Running'
+        
+        # Check checkbox state
+        # Look for checkbox controls within the main window that correspond to this instance
+        row_rect = instance_row.rectangle()
+        if row_rect:
+            # Calculate expected checkbox position
+            checkbox_x = row_rect.left + 36 + 15
+            checkbox_y = row_rect.top + 28
+            
+            # Try to find checkbox controls near this position
+            all_checkboxes = main_window.descendants(control_type="CheckBox")
+            for checkbox in all_checkboxes:
+                cb_rect = checkbox.rectangle()
+                if cb_rect:
+                    # Check if checkbox is in similar Y position (same row)
+                    if abs(cb_rect.top - checkbox_y) < 20:  # Within 20 pixels
+                        try:
+                            # Check if checkbox is checked
+                            if hasattr(checkbox, 'get_toggle_state'):
+                                toggle_state = checkbox.get_toggle_state()
+                                instance_info['checkbox_state'] = 'Checked' if toggle_state == 1 else 'Unchecked'
+                            else:
+                                # Alternative method using selection state
+                                try:
+                                    is_selected = checkbox.is_selected()
+                                    instance_info['checkbox_state'] = 'Checked' if is_selected else 'Unchecked'
+                                except:
+                                    # Try using window text or other properties
+                                    checkbox_text = checkbox.window_text()
+                                    if checkbox_text and "checked" in checkbox_text.lower():
+                                        instance_info['checkbox_state'] = 'Checked'
+                                    else:
+                                        instance_info['checkbox_state'] = 'Unchecked'
+                        except Exception as e:
+                            instance_info['checkbox_state'] = f'Error: {str(e)}'
+                        break
+        
+        # Fallback: Try to detect state from visual elements positioning
+        if instance_info['running_state'] == 'Unknown':
+            # Look for specific UI elements that indicate running state
+            all_elements = instance_row.descendants()
+            for elem in all_elements:
+                elem_class = elem.element_info.class_name or ""
+                elem_text = elem.window_text() or ""
+                
+                # Look for specific MuMu UI indicators
+                if "running" in elem_text.lower() or "run" in elem_class.lower():
+                    instance_info['running_state'] = 'Running'
+                    break
+                elif "start" in elem_text.lower() or "play" in elem_class.lower():
+                    instance_info['running_state'] = 'Not Started'
+                    break
+    
+    except Exception as e:
+        instance_info['running_state'] = f'Error: {str(e)}'
+        instance_info['checkbox_state'] = f'Error: {str(e)}'
+    
+    return instance_info
+
+if __name__ == "__main__":
+    main()
