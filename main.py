@@ -1,5 +1,7 @@
 import os
 import time
+import signal
+import sys
 from pywinauto import Application
 from pywinauto.mouse import click, move
 from pywinauto.timings import Timings
@@ -8,10 +10,13 @@ import random
 import string
 import enum
 
-# Increase default timeout to ensure controls are ready
-Timings.window_find_timeout = 5.0
+# Increase default timeout
+Timings.window_find_timeout = 10.0  # Increased for reliability
 
-# create a enum, witch is, FROM_START, TO_END, FROM_START, TO_MID, FROM_MID, TO_START
+class SelectionActions(enum.Enum):
+    START = 1
+    STOP = 2
+
 class SelectionPoints(enum.Enum):
     FROM_START = 1
     TO_END = 2
@@ -19,17 +24,33 @@ class SelectionPoints(enum.Enum):
     TO_START = 4
     TO_MID = 5
 
+# Global flag to signal termination
+global_should_stop = False
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C and other termination signals."""
+    global global_should_stop
+    print("\nReceived Ctrl+C, stopping gracefully...")
+    global_should_stop = True
+
 def main():
+    global global_should_stop
     mumu_path = r"D:\Program Files\Netease\MuMuPlayerGlobal-12.0\shell\MuMuMultiPlayer.exe"
     vm_base_name = "ROM_"
     vm_names = padronize_vm_names(vm_base_name)
+    if not vm_names:
+        print("Error: No VM names found. Exiting.")
+        return
+
+    # Register signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
 
     # Try to close MuMu Multi-Instance if already running
     try:
         app = Application(backend="uia").connect(title="MuMu Multi-instance 12", timeout=5)
         print("MuMu Multi-Instance is already running. Closing it first...")
         app.window(title="MuMu Multi-instance 12").close()
-        time.sleep(2)  # Wait for the process to close
+        time.sleep(2)
     except Exception:
         print("MuMu Multi-Instance is not running or could not connect.")
 
@@ -37,9 +58,9 @@ def main():
     print("Attempting to launch the program...")
     try:
         os.startfile(mumu_path)
-        print("Program launched successfully. Waiting 5 seconds for it to start...")
-        time.sleep(5)
-        app = Application(backend="uia").connect(title="MuMu Multi-instance 12", timeout=5)
+        print("Program launched successfully. Waiting 10 seconds for it to start...")
+        time.sleep(10)
+        app = Application(backend="uia").connect(title="MuMu Multi-instance 12", timeout=10)
         print("MuMu Multi-Instance window is now open.")
     except FileNotFoundError:
         print(f"Error: The MuMu Multi-Instance executable was not found at {mumu_path}.")
@@ -50,38 +71,276 @@ def main():
 
     main_window = app.window(title="MuMu Multi-instance 12")
     main_window.set_focus()
-    
-    # moving the mouse to the center of the main window
+
     main_window_rect = main_window.rectangle()
     center_x = main_window_rect.left + main_window_rect.width() // 2
     center_y = main_window_rect.top + main_window_rect.height() // 2
     move(coords=(center_x, center_y))
 
-    list_elements_on_window(main_window)
-    instances_range = list(range(1, 10))
-    manage_instances_searchbar(vm_names, instances_range, main_window, )
-    # interact_with_elements(main_window)
-    # find_and_inspect_toolbar(main_window)
+    # Uncomment to debug UI hierarchy
+    # list_elements_on_window(main_window)
 
-def manage_instances_searchbar(vm_names, instances_range, main_window, start_point=0, end_point=None):
+    # Start the routine to start/stop instances
+    print("Starting instance management routine...")
+    last_routine_run = None
+    last_routine_range = None
+    batch_size = 5
+    total_instances = len(vm_names)
+
+    # Main loop replacing threading.Timer
+    while not global_should_stop:
+        try:
+            current_time = time.time()
+            if last_routine_run is None or (current_time - last_routine_run) >= 50:  # 60-second interval
+                # Stop previous batch if it exists
+                if last_routine_range:
+                    print(f"Stopping previous batch: {last_routine_range}")
+                    start_instances_routine(main_window, vm_names, 
+                                           last_routine_range[0], 
+                                           last_routine_range[1], 
+                                           action=SelectionActions.STOP)
+                    time.sleep(10)  # Wait for stop to complete
+
+                # Calculate new batch
+                if last_routine_range is None:
+                    start_point = 1
+                    end_point = min(batch_size, total_instances)
+                else:
+                    start_point = last_routine_range[1] + 1
+                    end_point = min(start_point + batch_size - 1, total_instances)
+
+                if start_point > total_instances:
+                    print("All instances processed. Restarting from beginning.")
+                    start_point = 1
+                    end_point = min(batch_size, total_instances)
+
+                # Start the new batch
+                start_instances_routine(main_window, vm_names, start_point, end_point, 
+                                       action=SelectionActions.START)
+                # find_and_inspect_toolbar(main_window, action=SelectionActions.START)
+
+                last_routine_run = current_time
+                last_routine_range = (start_point, end_point)
+
+            # Short sleep to prevent CPU overuse and allow Ctrl+C to be processed
+            time.sleep(1)
+        except Exception as e:
+            print(f"Error in main loop: {str(e)}")
+            time.sleep(2)  # Prevent rapid error looping
+
+    # Cleanup before exiting
+    print("Performing cleanup...")
+    try:
+        if app.is_process_running():
+            app.window(title="MuMu Multi-instance 12").close()
+            print("Closed MuMu Multi-Instance window.")
+    except Exception as e:
+        print(f"Error during cleanup: {str(e)}")
+    
+    print("Program terminated.")
+    sys.exit(0)
+
+def start_instances_routine(main_window, vm_names, start_point=1, end_point=None, action=SelectionActions.START):
+    """
+    Routine to start or stop instances in batches.
+    """
+    global global_should_stop
+    if global_should_stop:
+        print("Termination signal received, stopping routine.")
+        return
+
+    if not vm_names:
+        print("Error: No VM names provided.")
+        return
+
+    if end_point is None:
+        end_point = len(vm_names)
+
+    print(f"Processing instances {start_point} to {end_point} with action {action.name}")
+
+    # wait for the main window to be ready
+    if not main_window.exists(timeout=5):
+        print("Main window not found. Exiting routine.")
+        return
+    
+    
+    unselect_all_instances(main_window)
+
+    # Ensure the main window is focused
+    main_window.set_focus()
+    time.sleep(0.5)  # Allow time for focus to settle
+
+    # Ensure the instance list is accessible
+    instance_list = main_window.child_window(class_name="PlayerListWidget", control_type="List")
+    if not instance_list.exists(timeout=5):
+        print("Instance list not found.")
+        return
+
+    for idx in range(start_point - 1, end_point):
+        if global_should_stop:
+            print("Termination signal received, stopping routine.")
+            return
+
+        if idx >= len(vm_names):
+            print(f"Reached end of VM names at index {idx}. Stopping.")
+            break
+
+        vm_name = vm_names[idx]
+        print(f"Processing instance {idx + 1}: {vm_name}")
+
+        # Use search bar to locate the instance
+        search_bar = main_window.child_window(control_type="Edit", class_name="SearchEdit")
+        if not search_bar.exists(timeout=5):
+            print("Search bar not found.")
+            continue
+
+        try:
+            search_bar.set_focus()
+            time.sleep(0.2)
+            search_bar.set_edit_text("")  # Clear existing text
+            time.sleep(0.2)
+            send_keys(vm_name.upper(), with_spaces=True)
+            time.sleep(1)  # Allow search results to update
+
+            # Click the checkbox of the first result
+            instances = instance_list.children(control_type="ListItem")
+            if instances:
+                first_instance = instances[0]
+                row_rect = first_instance.rectangle()
+                if row_rect:
+                    checkbox_x = row_rect.left + 36 + 15
+                    checkbox_y = row_rect.top + 28
+                    click(coords=(checkbox_x, checkbox_y))
+                    print(f"Clicked checkbox for instance: {vm_name}")
+                else:
+                    print(f"Could not get rectangle for instance: {vm_name}")
+            else:
+                print(f"No instances found for VM: {vm_name}")
+        except Exception as e:
+            print(f"Error processing {vm_name} via search bar: {str(e)}")
+            continue
+
+        time.sleep(2)  # Wait before next instance
+
+    # in the end will clear the search bar
+    try:
+        search_bar.set_edit_text("")  # Clear the search bar after processing
+        print("Cleared search bar after processing instances.")
+    except Exception as e:
+        print(f"Error clearing search bar: {str(e)}")
+
+    # wait 1 second before clicking the toolbar action
+    time.sleep(1)
+    # Click the toolbar action (Start or Stop)
+    # click_toolbar_action(main_window, action)
+    # print(f"Finished {action.name} routine for instances {start_point} to {end_point}")
+    find_and_inspect_toolbar(main_window, action=action)
+    
+def click_toolbar_action(main_window, action: SelectionActions):
+    """
+    Clicks a specific action button in the toolbar.
+    """
+    global global_should_stop
+    if global_should_stop:
+        print("Termination signal received, skipping toolbar action.")
+        return
+
+    toolbar = main_window.child_window(control_type="Group", class_name="QWidget")
+    if not toolbar.exists(timeout=5):
+        print("Toolbar not found.")
+        return
+
+    buttons = toolbar.children(control_type="Button")
+    if not buttons or len(buttons) < 2:
+        print("Not enough buttons found in toolbar.")
+        return
+
+    try:
+        if action == SelectionActions.START:
+            buttons[0].click_input()
+            print("Clicked 'Start' button in toolbar.")
+        elif action == SelectionActions.STOP:
+            buttons[1].click_input()
+            print("Clicked 'Stop' button in toolbar. Waiting for confirmation dialog...")
+            time.sleep(2)  # Increased wait for dialog to appear
+
+            # Connect to the application and find the confirmation dialog
+            app = Application(backend="uia").connect(title_re=".*", timeout=5)
+            dialog = app.window(class_name="NemuMessageBox")
+            max_attempts = 3
+            attempt = 1
+
+            while attempt <= max_attempts:
+                if dialog.exists(timeout=5):
+                    print("Confirmation dialog detected.")
+                    # Find all buttons in the dialog
+                    dialog_buttons = dialog.children(control_type="Button")
+                    confirm_button = None
+
+                    # Look for the rightmost button (NemuPushButton8)
+                    for button in dialog_buttons:
+                        button_rect = button.rectangle()
+                        if button_rect and button_rect.left > 1280:  # Based on logs, NemuPushButton8 starts at L1288
+                            confirm_button = button
+                            break
+
+                    if confirm_button:
+                        try:
+                            confirm_button.click_input()
+                            print("Clicked 'Confirm' button in dialog.")
+                            time.sleep(1)  # Wait for dialog to close
+                            return
+                        except Exception as e:
+                            print(f"Error clicking Confirm button: {str(e)}")
+                    else:
+                        print("Could not find 'Confirm' button in dialog.")
+                else:
+                    print(f"Confirmation dialog not found on attempt {attempt}.")
+                
+                time.sleep(1)  # Wait before retrying
+                attempt += 1
+
+            print(f"Failed to find or click 'Confirm' button after {max_attempts} attempts.")
+    except Exception as e:
+        print(f"Error clicking toolbar button for {action.name}: {str(e)}")
+
+def unselect_all_instances(main_window):
+    select_all_checkbox = main_window.child_window(control_type="CheckBox", title="Select All")
+    if select_all_checkbox.exists(timeout=2):
+        select_all_checkbox.click_input()
+        print("Clicked 'Select All' checkbox to unselect all instances.")
+        time.sleep(1)
+        
+        select_all_checkbox.click_input()
+        print("Clicked 'Select All' checkbox to select all instances.")
+        # wait for the UI to update
+        time.sleep(1)
+    else:
+        print("'Select All' checkbox not found.")
+
+def manage_instances_searchbar(vm_names, main_window, start_point=1, end_point=None):
     """
     Start searching for instances in the search bar and select them.
-    Args:
-        vm_names: List of VM names to search for
-        instances_range: Range of instances to select
-        main_window: The main MuMu Multi-Instance window
     """
     search_bar = main_window.child_window(control_type="Edit", class_name="SearchEdit")
     if not search_bar.exists(timeout=5):
         print("Search bar not found.")
         return
 
+    # make sure the window is focused
+    main_window.set_focus()
+
     print("Starting instance selection process...")
     for idx, vm_name in enumerate(vm_names):
-        if idx not in instances_range:
+        if end_point is not None and idx >= end_point:
+            print(f"Reached end point at index {idx}. Stopping further searches.")
+            break
+
+        if start_point is not None and idx < start_point - 1:
+            print(f"Skipping index {idx} as it is below the start point {start_point}.")
             continue
-        
-        print(f"Searching for VM {idx}: {vm_name.upper()}")
+
+        print(f"Searching for VM {idx + 1}: {vm_name.upper()}")
         try:
             search_bar.set_focus()
             time.sleep(0.2)
@@ -89,146 +348,33 @@ def manage_instances_searchbar(vm_names, instances_range, main_window, start_poi
             time.sleep(0.2)
             send_keys(vm_name.upper(), with_spaces=True)
             time.sleep(1)  # Allow time for search results to update
+
+            instance_list = main_window.child_window(class_name="PlayerListWidget", control_type="List")
+            if instance_list.exists():
+                instances = instance_list.children(control_type="ListItem")
+                if instances:
+                    first_instance = instances[0]
+                    row_rect = first_instance.rectangle()
+                    if row_rect:
+                        checkbox_x = row_rect.left + 36 + 15
+                        checkbox_y = row_rect.top + 28
+                        click(coords=(checkbox_x, checkbox_y))
+                        print(f"Clicked checkbox for instance: {vm_name}")
+                    else:
+                        print(f"Could not get rectangle for first instance of VM: {vm_name}")
+                else:
+                    print(f"No instances found for VM: {vm_name}")
+            else:
+                print("Instance list not found.")
         except Exception as e:
             print(f"Error focusing or typing in search bar: {e}")
             continue
 
-        # Click the first result in the list
-        instance_list = main_window.child_window(class_name="PlayerListWidget", control_type="List")
-       
-        if instance_list.exists():
-            instances = instance_list.children(control_type="ListItem")
-            if instances:
-                first_instance = instances[0]
-                row_rect = first_instance.rectangle()
-                if row_rect:
-                    # Calculate checkbox position (same logic as elsewhere)
-                    checkbox_x = row_rect.left + 36 + 15
-                    checkbox_y = row_rect.top + 28
-                    click(coords=(checkbox_x, checkbox_y))
-                    print(f"Clicked checkbox for instance: {vm_name}")
-                else:
-                    print(f"Could not get rectangle for first instance of VM: {vm_name}")
-            else:
-                print(f"No instances found for VM: {vm_name}")
-        else:
-            print("Instance list not found.")
-
-        time.sleep(1)  # Wait before next iteration
-
-def interact_with_elements(window):
-    # Re-query the instance list to ensure fresh data
-    instance_list = window.child_window(class_name="PlayerListWidget", control_type="List")
-    if not instance_list.exists(timeout=5):
-        print("Instance list not found.")
-        return
-
-    # Test scroll methods before proceeding
-    # test_scroll_methods_on_list(instance_list)
-
-    instances_to_select = list(range(1, 6 + 1))
-    action = "stop"
-
-    print("\nAnalyzing instance states before selection...")
-    # Re-fetch children to ensure fresh state
-    instances = instance_list.children(control_type="ListItem")
-    
-    print("=" * 80)
-    print("INSTANCE STATUS REPORT")
-    print("=" * 80)
-    
-    for index, instance_row in enumerate(instances):
-        # Skip non-ListItem controls
-        if instance_row.element_info.control_type != "ListItem":
-            continue
-
-        # Get initial bounding rectangle
-        row_rect = instance_row.rectangle()
-        if not row_rect:
-            print(f"No bounding rectangle found for instance at index {index}. Skipping.")
-            continue
-
-        # Analyze instance state
-        instance_info = analyze_instance_state(instance_row, index, window)
-        
-        print(f"Instance {index}:")
-        print(f"  Name: {instance_info['name']}")
-        print(f"  Running State: {instance_info['running_state']}")
-        print(f"  Checkbox State: {instance_info['checkbox_state']}")
-        print(f"  Rectangle: {row_rect}")
-        print("-" * 40)
-
-    print("\nNow selecting instances...")
-    
-    # Click and unclick the Select All checkbox
-    select_all_checkbox = window.child_window(control_type="CheckBox", title="Select All")
-    if select_all_checkbox.exists(timeout=2):
-        select_all_checkbox.click_input()
-        print("Clicked 'Select All' checkbox to select all instances.")
         time.sleep(1)
-        select_all_checkbox.click_input()
-        print("Clicked 'Select All' checkbox again to unselect all instances.")
-        time.sleep(1)
-    else:
-        print("'Select All' checkbox not found.")
-        
-    # Re-fetch instances again for selection
-    instances = instance_list.children(control_type="ListItem")
-    for index, instance_row in enumerate(instances):
-        # Skip non-ListItem controls
-        if instance_row.element_info.control_type != "ListItem":
-            continue
-
-        # Get initial bounding rectangle
-        row_rect = instance_row.rectangle()
-        if not row_rect:
-            print(f"No bounding rectangle found for instance at index {index}. Skipping.")
-            continue
-
-        checkbox_x = row_rect.left + 36 + 15
-        checkbox_y = row_rect.top + 28
-
-        if index in instances_to_select:
-            # Re-query the specific list item to verify position
-            instance_list = window.child_window(class_name="PlayerListWidget", control_type="List")
-            instances = instance_list.children(control_type="ListItem")
-            if index >= len(instances):
-                print(f"Instance at index {index} no longer exists. Skipping.")
-                continue
-            instance_row = instances[index]
-            rechecked_rect = instance_row.rectangle()
-            if rechecked_rect == row_rect:
-                click(coords=(checkbox_x, checkbox_y))
-                print(f"Clicked verified checkbox position at ({checkbox_x}, {checkbox_y}) for instance at index {index}.")
-                
-                # Improved scrolling with multiple fallback methods
-                scroll_success = scroll_instance_list(instance_list, direction="down", amount=2)
-                if not scroll_success:
-                    print("Warning: Could not scroll the instance list. Continuing without scrolling.")
-                    
-            else:
-                print(f"Position mismatch for instance at index {index}. Skipping click.")
-
-    # Re-read screen to print instance statuses
-    print("\nRe-reading screen to verify instance statuses...")
-    instance_list = window.child_window(class_name="PlayerListWidget", control_type="List")
-    instances = instance_list.children(control_type="ListItem")
-    for index, instance_row in enumerate(instances):
-        if instance_row.element_info.control_type != "ListItem":
-            continue
-        row_rect = instance_row.rectangle()
-        print(f"Instance {index}: Rect: {row_rect}, Name: {instance_row.window_text() or '[No Name]'}")
-
 
 def padronize_vm_names(vm_name_prefix) -> list[str]:
-    """
-    Assigns a unique 7-character VM name (e.g., ROM_UGER7) to each MuMu instance,
-    updates the config, and returns the list of new names.
-    Ensures names do not repeat and are unique for each VM.
-    """
     import os
     import json
-
     vm_dir = r"D:\Program Files\Netease\MuMuPlayerGlobal-12.0\vms"
     vm_names = []
     used_names = set()
@@ -243,21 +389,16 @@ def padronize_vm_names(vm_name_prefix) -> list[str]:
 
     for dir_name in os.listdir(vm_dir):
         dir_path = os.path.join(vm_dir, dir_name)
-        if not os.path.isdir(dir_path):
-            continue
-
-        if not dir_name.startswith("MuMuPlayerGlobal-12.0-"):
+        if not os.path.isdir(dir_path) or not dir_name.startswith("MuMuPlayerGlobal-12.0-"):
             continue
 
         config_path = os.path.join(dir_path, "configs")
         config_file = os.path.join(config_path, "extra_config.json")
-
         if not os.path.exists(config_file):
             print(f"No config file found: {config_file}")
             continue
 
         print(f"Found config file: {config_file}")
-
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 config_data = json.load(f)
@@ -422,7 +563,8 @@ def scroll_instance_list(instance_list, direction="down", amount=2):
             if list_rect:
                 center_x = list_rect.left + list_rect.width() // 2
                 center_y = list_rect.top + list_rect.height() // 2
-                from pywinauto.mouse import click
+                
+
                 click(coords=(center_x, center_y))
                 time.sleep(0.2)
                 if is_control_focused(instance_list):
@@ -489,23 +631,26 @@ def scroll_instance_list(instance_list, direction="down", amount=2):
     print("All scroll methods failed")
     return False
 
-def find_and_inspect_toolbar(window):
+def find_and_inspect_toolbar(window, action=SelectionActions.START):
     """
     Find the toolbar based on the node tree structure and inspect all its button children.
     The toolbar is the bottom Group containing all the action buttons.
+    The first button is 'Start', the second is 'Stop'.
     """
     print("\nSearching for toolbar...")
-    
+
     # Based on the node tree, the toolbar should be at the bottom of the window
     # Look for Group elements that contain multiple Button children
     all_groups = window.descendants(control_type="Group")
     toolbar = None
     
+    window.set_focus()
+
     for group in all_groups:
         rect = group.rectangle()
         if not rect:
             continue
-            
+
         # The toolbar should be at the bottom of the window (Y coordinate around 804-860)
         # and contain multiple buttons
         if rect.top >= 800 and rect.bottom <= 900:
@@ -515,7 +660,7 @@ def find_and_inspect_toolbar(window):
                 print(f"Found toolbar at rectangle: {rect}")
                 print(f"Toolbar contains {len(buttons)} buttons")
                 break
-    
+
     if not toolbar:
         print("Toolbar not found. Searching more broadly...")
         # Alternative approach: look for any group with many buttons
@@ -527,7 +672,7 @@ def find_and_inspect_toolbar(window):
                 print(f"Found toolbar candidate at rectangle: {rect}")
                 print(f"Toolbar contains {len(buttons)} buttons")
                 break
-    
+
     if not toolbar:
         print("Toolbar still not found. Let me try a different approach...")
         # Try to find it by looking for specific button patterns
@@ -546,22 +691,22 @@ def find_and_inspect_toolbar(window):
                         break
         except Exception as e:
             print(f"Error in alternative search: {e}")
-    
+
     if not toolbar:
         print("Toolbar could not be found using any method.")
         return
-    
+
     # Inspect all buttons in the toolbar
     print(f"\nInspecting toolbar buttons...")
     buttons = toolbar.children(control_type="Button")
-    
+
     if not buttons:
         print("No buttons found in toolbar.")
         return
-    
+
     print(f"Found {len(buttons)} buttons in toolbar:")
     print("-" * 80)
-    
+
     for idx, button in enumerate(buttons):
         try:
             button_rect = button.rectangle()
@@ -570,8 +715,23 @@ def find_and_inspect_toolbar(window):
             automation_id = button.element_info.automation_id or "[No AutomationId]"
             is_enabled = button.is_enabled()
             is_visible = button.is_visible()
-            
-            print(f"Button {idx + 1}:")
+
+            # Mark first and second buttons as Start and Stop
+            if idx == 0:
+                logical_name = "START (first button)"
+                if action == SelectionActions.START:
+                    button.click_input()
+            elif idx == 1:
+                logical_name = "STOP (second button)"
+                if action == SelectionActions.STOP:
+                    button.click_input()
+                    list_elements_on_window(window)  # Inspect the window after clicking Stop
+                    # it should click the node that has the Text Confirm
+                    
+            else:
+                logical_name = ""
+
+            print(f"Button {idx + 1}: {logical_name}")
             print(f"  Name: {button_name}")
             print(f"  Class: {button_class}")
             print(f"  AutomationId: {automation_id}")
