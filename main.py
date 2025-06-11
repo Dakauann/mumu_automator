@@ -91,7 +91,12 @@ def main():
     while not global_should_stop:
         try:
             current_time = time.time()
-            if last_routine_run is None or (current_time - last_routine_run) >= 50:  # 60-second interval
+            print(f"\nCurrent time: {time.ctime(current_time)}")
+            print(f"Last routine run: {last_routine_run}, Last routine range: {last_routine_range}")
+            # tome for next routine run
+            print(f"Time remaining for next routine run: {600 - (current_time - last_routine_run) if last_routine_run else 'N/A'} seconds")
+            print("--------------------------------------------------------")
+            if last_routine_run is None or (current_time - last_routine_run) >= 600:  # 10-minute interval
                 # Stop previous batch if it exists
                 if last_routine_range:
                     print(f"Stopping previous batch: {last_routine_range}")
@@ -162,7 +167,6 @@ def start_instances_routine(main_window, vm_names, start_point=1, end_point=None
     if not main_window.exists(timeout=5):
         print("Main window not found. Exiting routine.")
         return
-    
     
     unselect_all_instances(main_window)
 
@@ -237,9 +241,6 @@ def start_instances_routine(main_window, vm_names, start_point=1, end_point=None
     find_and_inspect_toolbar(main_window, action=action)
     
 def click_toolbar_action(main_window, action: SelectionActions):
-    """
-    Clicks a specific action button in the toolbar.
-    """
     global global_should_stop
     if global_should_stop:
         print("Termination signal received, skipping toolbar action.")
@@ -275,16 +276,8 @@ def click_toolbar_action(main_window, action: SelectionActions):
                     print("Confirmation dialog detected.")
                     # Find all buttons in the dialog
                     dialog_buttons = dialog.children(control_type="Button")
-                    confirm_button = None
-
-                    # Look for the rightmost button (NemuPushButton8)
-                    for button in dialog_buttons:
-                        button_rect = button.rectangle()
-                        if button_rect and button_rect.left > 1280:  # Based on logs, NemuPushButton8 starts at L1288
-                            confirm_button = button
-                            break
-
-                    if confirm_button:
+                    if dialog_buttons:
+                        confirm_button = dialog_buttons[0]  # First button is "Confirm"
                         try:
                             confirm_button.click_input()
                             print("Clicked 'Confirm' button in dialog.")
@@ -293,7 +286,7 @@ def click_toolbar_action(main_window, action: SelectionActions):
                         except Exception as e:
                             print(f"Error clicking Confirm button: {str(e)}")
                     else:
-                        print("Could not find 'Confirm' button in dialog.")
+                        print("No buttons found in dialog.")
                 else:
                     print(f"Confirmation dialog not found on attempt {attempt}.")
                 
@@ -632,15 +625,8 @@ def scroll_instance_list(instance_list, direction="down", amount=2):
     return False
 
 def find_and_inspect_toolbar(window, action=SelectionActions.START):
-    """
-    Find the toolbar based on the node tree structure and inspect all its button children.
-    The toolbar is the bottom Group containing all the action buttons.
-    The first button is 'Start', the second is 'Stop'.
-    """
     print("\nSearching for toolbar...")
 
-    # Based on the node tree, the toolbar should be at the bottom of the window
-    # Look for Group elements that contain multiple Button children
     all_groups = window.descendants(control_type="Group")
     toolbar = None
     
@@ -650,12 +636,9 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
         rect = group.rectangle()
         if not rect:
             continue
-
-        # The toolbar should be at the bottom of the window (Y coordinate around 804-860)
-        # and contain multiple buttons
         if rect.top >= 800 and rect.bottom <= 900:
             buttons = group.children(control_type="Button")
-            if len(buttons) >= 5:  # Should have multiple action buttons
+            if len(buttons) >= 5:
                 toolbar = group
                 print(f"Found toolbar at rectangle: {rect}")
                 print(f"Toolbar contains {len(buttons)} buttons")
@@ -663,10 +646,9 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
 
     if not toolbar:
         print("Toolbar not found. Searching more broadly...")
-        # Alternative approach: look for any group with many buttons
         for group in all_groups:
             buttons = group.children(control_type="Button")
-            if len(buttons) >= 6:  # At least 6 buttons based on the node tree
+            if len(buttons) >= 6:
                 toolbar = group
                 rect = group.rectangle()
                 print(f"Found toolbar candidate at rectangle: {rect}")
@@ -675,14 +657,11 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
 
     if not toolbar:
         print("Toolbar still not found. Let me try a different approach...")
-        # Try to find it by looking for specific button patterns
         try:
-            # Look for the main container that holds all the content
             main_container = window.child_window(class_name="QWidget")
             if main_container.exists():
-                # Look for the last Group in the hierarchy which should be the toolbar
                 groups = main_container.descendants(control_type="Group")
-                for group in reversed(groups):  # Start from the last groups
+                for group in reversed(groups):
                     buttons = group.children(control_type="Button")
                     if len(buttons) >= 5:
                         toolbar = group
@@ -696,7 +675,6 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
         print("Toolbar could not be found using any method.")
         return
 
-    # Inspect all buttons in the toolbar
     print(f"\nInspecting toolbar buttons...")
     buttons = toolbar.children(control_type="Button")
 
@@ -716,7 +694,6 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
             is_enabled = button.is_enabled()
             is_visible = button.is_visible()
 
-            # Mark first and second buttons as Start and Stop
             if idx == 0:
                 logical_name = "START (first button)"
                 if action == SelectionActions.START:
@@ -725,9 +702,66 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
                 logical_name = "STOP (second button)"
                 if action == SelectionActions.STOP:
                     button.click_input()
-                    list_elements_on_window(window)  # Inspect the window after clicking Stop
-                    # it should click the node that has the Text Confirm
-                    
+                    print("Clicked 'Stop' button. Waiting for confirmation dialog...")
+                    time.sleep(6)  # Increased wait time
+
+                    # Debug: List all elements to confirm dialog presence
+                    list_elements_on_window(window)
+                    print("Searching for dialog in current window hierarchy...")
+                    dialogs = window.descendants(class_name="NemuMessageBox")
+                    if dialogs:
+                        dialog = dialogs[0]
+
+                        # Recursively search for the first NemuPushButton7 and click it
+                        def find_and_click_pushbutton7(control):
+                            if control.element_info.class_name == "NemuUiLib::NemuPushButton7":
+                                try:
+                                    control.click_input()
+                                    print("Clicked the first NemuPushButton7 in the dialog.")
+                                    return True
+                                except Exception as e:
+                                    print(f"Error clicking NemuPushButton7: {e}")
+                                    return False
+                            for child in control.children():
+                                if find_and_click_pushbutton7(child):
+                                    return True
+                            return False
+
+                        if not find_and_click_pushbutton7(dialog):
+                            print("NemuPushButton7 not found or could not be clicked.")
+                    else:
+                        print("No NemuMessageBox found in current window hierarchy.")
+                        return
+
+                    max_attempts = 5
+                    attempt = 1
+
+                    while attempt <= max_attempts:
+                        if dialog.exists(timeout=5):
+                            print("Confirmation dialog detected.")
+                            dialog.set_focus()  # Ensure dialog is focused
+                            dialog_buttons = dialog.children(control_type="Button")
+                            if dialog_buttons:
+                                confirm_button = dialog_buttons[0]  # First button is "Confirm"
+                                if confirm_button.is_enabled() and confirm_button.is_visible():
+                                    try:
+                                        confirm_button.click_input()
+                                        print("Clicked 'Confirm' button in dialog.")
+                                        time.sleep(1)  # Wait for dialog to close
+                                        return
+                                    except Exception as e:
+                                        print(f"Error clicking Confirm button: {str(e)}. Retrying...")
+                                else:
+                                    print("Confirm button not enabled or visible.")
+                            else:
+                                print("No buttons found in dialog.")
+                        else:
+                            print(f"Confirmation dialog not found on attempt {attempt}.")
+                        
+                        time.sleep(1)  # Wait before retrying
+                        attempt += 1
+
+                    print(f"Failed to find or click 'Confirm' button after {max_attempts} attempts.")
             else:
                 logical_name = ""
 
@@ -743,7 +777,8 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
             print("-" * 40)
         except Exception as e:
             print(f"Error inspecting button {idx + 1}: {str(e)}")
-            
+            continue  # Continue to the next button despite the error
+
 def analyze_instance_state(instance_row, index, main_window):
     """
     Analyze the state of a MuMu instance to determine if it's running and if checkbox is checked.
