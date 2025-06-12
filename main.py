@@ -87,6 +87,11 @@ def main():
 
     vm_base_name = "ROM_"
     vm_names = padronize_vm_names(vm_base_name, mumu_base_path)
+    last_routine_run = None
+    last_routine_range = None
+    batch_size = int(input("Enter batch size: "))
+    total_instances = len(vm_names)
+    
     if not vm_names:
         print("Error: No VM names found. Exiting.")
         return
@@ -131,10 +136,7 @@ def main():
 
     # Start the routine to start/stop instances
     print("Starting instance management routine...")
-    last_routine_run = None
-    last_routine_range = None
-    batch_size = int(input("Enter batch size: "))
-    total_instances = len(vm_names)
+    
 
     # Main loop replacing threading.Timer
     while not global_should_stop:
