@@ -40,6 +40,8 @@ def main():
     # Persistent storage for last used path in a JSON file
     last_path_file = "last_mumu_path.json"
     mumu_base_path = None
+    # 40 minutes cycle interval: 2400 seconds
+    cycle_interval = 2400  # seconds
 
     # Try to load last used path from JSON
     if os.path.isfile(last_path_file):
@@ -131,7 +133,7 @@ def main():
     print("Starting instance management routine...")
     last_routine_run = None
     last_routine_range = None
-    batch_size = 5
+    batch_size = int(input("Enter batch size: "))
     total_instances = len(vm_names)
 
     # Main loop replacing threading.Timer
@@ -141,9 +143,9 @@ def main():
             print(f"\nCurrent time: {time.ctime(current_time)}")
             print(f"Last routine run: {last_routine_run}, Last routine range: {last_routine_range}")
             # tome for next routine run
-            print(f"Time remaining for next routine run: {600 - (current_time - last_routine_run) if last_routine_run else 'N/A'} seconds")
+            print(f"Time remaining for next routine run: {cycle_interval - (current_time - last_routine_run) if last_routine_run else 'N/A'} seconds")
             print("--------------------------------------------------------")
-            if last_routine_run is None or (current_time - last_routine_run) >= 180:  # 10-minute interval
+            if last_routine_run is None or (current_time - last_routine_run) >= cycle_interval:  # 10-minute interval
                 # Stop previous batch if it exists
                 if last_routine_range:
                     print(f"Stopping previous batch: {last_routine_range}")
