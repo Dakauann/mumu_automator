@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import signal
@@ -35,9 +36,55 @@ def signal_handler(sig, frame):
 
 def main():
     global global_should_stop
-    mumu_path = r"D:\Program Files\Netease\MuMuPlayerGlobal-12.0\shell\MuMuMultiPlayer.exe"
+
+    # Persistent storage for last used path in a JSON file
+    last_path_file = "last_mumu_path.json"
+    mumu_base_path = None
+
+    # Try to load last used path from JSON
+    if os.path.isfile(last_path_file):
+        try:
+            with open(last_path_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            prev_path = data.get("mumu_base_path", "").strip()
+            if prev_path and os.path.isdir(prev_path):
+                print(f"Previously used MuMu installation path: {prev_path}")
+                choice = input("Use this path? (0: reuse, 1: change path)\n> ").strip()
+                if choice == "0":
+                    mumu_base_path = prev_path
+                    mumu_path = os.path.join(mumu_base_path, "shell", "MuMuMultiPlayer.exe")
+        except Exception as e:
+            print(f"Could not load previous path from JSON: {e}")
+
+    # Prompt user for MuMu Multi-Instance executable path if not reusing
+    while not mumu_base_path:
+        mumu_base_path = input(
+            "Enter the base path to MuMu installation (e.g., D:\\Program Files\\Netease\\MuMuPlayerGlobal-12.0):\n> "
+        ).strip('"').strip()
+        if not mumu_base_path:
+            print("Path cannot be empty. Please try again.")
+            continue
+        if not os.path.isdir(mumu_base_path):
+            print(f"Directory not found at: {mumu_base_path}")
+            mumu_base_path = None
+            continue
+        mumu_path = os.path.join(mumu_base_path, "shell", "MuMuMultiPlayer.exe")
+        if not os.path.isfile(mumu_path):
+            print(f"MuMuMultiPlayer.exe not found at: {mumu_path}")
+            mumu_base_path = None
+            continue
+        # Save path for next time in JSON
+        try:
+            with open(last_path_file, "w", encoding="utf-8") as f:
+                json.dump({"mumu_base_path": mumu_base_path}, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"Could not save path to JSON: {e}")
+        break
+
+    print(f"Using MuMu Multi-Instance executable at: {mumu_path}")
+
     vm_base_name = "ROM_"
-    vm_names = padronize_vm_names(vm_base_name)
+    vm_names = padronize_vm_names(vm_base_name, mumu_base_path)
     if not vm_names:
         print("Error: No VM names found. Exiting.")
         return
@@ -96,7 +143,7 @@ def main():
             # tome for next routine run
             print(f"Time remaining for next routine run: {600 - (current_time - last_routine_run) if last_routine_run else 'N/A'} seconds")
             print("--------------------------------------------------------")
-            if last_routine_run is None or (current_time - last_routine_run) >= 600:  # 10-minute interval
+            if last_routine_run is None or (current_time - last_routine_run) >= 180:  # 10-minute interval
                 # Stop previous batch if it exists
                 if last_routine_range:
                     print(f"Stopping previous batch: {last_routine_range}")
@@ -365,10 +412,12 @@ def manage_instances_searchbar(vm_names, main_window, start_point=1, end_point=N
 
         time.sleep(1)
 
-def padronize_vm_names(vm_name_prefix) -> list[str]:
+def padronize_vm_names(vm_name_prefix, mumu_base_path) -> list[str]:
     import os
     import json
-    vm_dir = r"D:\Program Files\Netease\MuMuPlayerGlobal-12.0\vms"
+    # vm_dir = r"D:\Program Files\Netease\MuMuPlayerGlobal-12.0\vms"
+    # D:\Program Files\Netease\MuMuPlayerGlobal-12.0\vms will extract this part from the
+    vm_dir = os.path.join(mumu_base_path, "vms")
     vm_names = []
     used_names = set()
 
