@@ -122,10 +122,10 @@ def main():
     main_window = app.window(title="MuMu Multi-instance 12")
     main_window.set_focus()
 
-    main_window_rect = main_window.rectangle()
-    center_x = main_window_rect.left + main_window_rect.width() // 2
-    center_y = main_window_rect.top + main_window_rect.height() // 2
-    move(coords=(center_x, center_y))
+    # main_window_rect = main_window.rectangle()
+    # center_x = main_window_rect.left + main_window_rect.width() // 2
+    # center_y = main_window_rect.top + main_window_rect.height() // 2
+    # move(coords=(center_x, center_y))
 
     print("Starting instance management...")
     
