@@ -1,0 +1,1 @@
+C:\Users\dakau\AppData\Roaming\Python\Python312\Scripts\pyinstaller.exe --onefile main.py

@@ -1,15 +1,18 @@
+import ctypes
+from ctypes import wintypes
 import json
 import os
+import threading
 import time
 import signal
 import sys
 from pywinauto import Application
 from pywinauto.mouse import click, move
 from pywinauto.timings import Timings
-from pywinauto.keyboard import send_keys
 import random
 import string
 import enum
+import win32con
 
 # Increase default timeout
 Timings.window_find_timeout = 10.0  # Increased for reliability
@@ -25,7 +28,6 @@ class SelectionPoints(enum.Enum):
     TO_START = 4
     TO_MID = 5
 
-# Global flag to signal termination
 global_should_stop = False
 
 def signal_handler(sig, frame):
@@ -37,90 +39,84 @@ def signal_handler(sig, frame):
 def main():
     global global_should_stop
 
-    # Persistent storage for last used path in a JSON file
     last_path_file = "last_mumu_path.json"
     mumu_base_path = None
-    # 40 minutes cycle interval: 2400 seconds
-    cycle_interval = 2400  # seconds
+    cycle_interval = 480
+    
+    try:
+        with open(last_path_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        prev_path = data.get("mumu_base_path", "").strip()
+        if prev_path and os.path.isdir(prev_path):
+            print(f"Previously used MuMu installation path: {prev_path}")
+            choice = input("Use path? (0: reuse, 1: change path):").strip()
+            if choice == "0":
+                mumu_base_path = prev_path
+                mumu_path = os.path.join(prev_path, "shell", "MuMuMultiPlayer.exe")
+    except Exception as e:
+        print(f"Could not load previous path: {e}")
 
-    # Try to load last used path from JSON
-    if os.path.isfile(last_path_file):
-        try:
-            with open(last_path_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            prev_path = data.get("mumu_base_path", "").strip()
-            if prev_path and os.path.isdir(prev_path):
-                print(f"Previously used MuMu installation path: {prev_path}")
-                choice = input("Use this path? (0: reuse, 1: change path)\n> ").strip()
-                if choice == "0":
-                    mumu_base_path = prev_path
-                    mumu_path = os.path.join(mumu_base_path, "shell", "MuMuMultiPlayer.exe")
-        except Exception as e:
-            print(f"Could not load previous path from JSON: {e}")
-
-    # Prompt user for MuMu Multi-Instance executable path if not reusing
     while not mumu_base_path:
         mumu_base_path = input(
-            "Enter the base path to MuMu installation (e.g., D:\\Program Files\\Netease\\MuMuPlayerGlobal-12.0):\n> "
+            "Enter MuMu installation path (e.g., D:\\Program Files\\Netease\\MuMuPlayerGlobal-12.0):\n> "
         ).strip('"').strip()
         if not mumu_base_path:
-            print("Path cannot be empty. Please try again.")
+            print("Path cannot be empty.")
             continue
         if not os.path.isdir(mumu_base_path):
-            print(f"Directory not found at: {mumu_base_path}")
+            print(f"Directory not found: {mumu_base_path}")
             mumu_base_path = None
             continue
         mumu_path = os.path.join(mumu_base_path, "shell", "MuMuMultiPlayer.exe")
-        if not os.path.isfile(mumu_path):
-            print(f"MuMuMultiPlayer.exe not found at: {mumu_path}")
+        if not os.path.exists(mumu_path):
+            print(f"MuMuMultiPlayer.exe not found: {mumu_path}")
             mumu_base_path = None
             continue
-        # Save path for next time in JSON
         try:
             with open(last_path_file, "w", encoding="utf-8") as f:
-                json.dump({"mumu_base_path": mumu_base_path}, f, indent=2, ensure_ascii=False)
+                json.dump({"mumu_base_path": mumu_base_path}, f)
+            print(f"Saved path to {last_path_file}")
         except Exception as e:
-            print(f"Could not save path to JSON: {e}")
+            print(f"Could not save path: {e}")
         break
 
-    print(f"Using MuMu Multi-Instance executable at: {mumu_path}")
+    print(f"Using MuMu executable: {mumu_path}")
 
     vm_base_name = "ROM_"
+    print("Scanning for VM names...")
     vm_names = padronize_vm_names(vm_base_name, mumu_base_path)
+    print(f"Found {len(vm_names)} VM(s): {vm_names}")
     last_routine_run = None
     last_routine_range = None
     batch_size = int(input("Enter batch size: "))
     total_instances = len(vm_names)
     
     if not vm_names:
-        print("Error: No VM names found. Exiting.")
+        print("Error: No VM names found. Please create VMs in MuMu Multi-Instance Manager.")
         return
 
-    # Register signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Try to close MuMu Multi-Instance if already running
     try:
         app = Application(backend="uia").connect(title="MuMu Multi-instance 12", timeout=5)
-        print("MuMu Multi-Instance is already running. Closing it first...")
+        print("MuMu Multi-Instance running. Closing...")
         app.window(title="MuMu Multi-instance 12").close()
         time.sleep(2)
     except Exception:
-        print("MuMu Multi-Instance is not running or could not connect.")
+        print("MuMu Multi-Instance not running.")
 
-    # Start MuMu Multi-Instance
-    print("Attempting to launch the program...")
+    print("Launching program...")
     try:
         os.startfile(mumu_path)
-        print("Program launched successfully. Waiting 10 seconds for it to start...")
+        print("Program launched. Waiting 10 seconds...")
         time.sleep(10)
         app = Application(backend="uia").connect(title="MuMu Multi-instance 12", timeout=10)
-        print("MuMu Multi-Instance window is now open.")
+        print("MuMu Multi-Instance window open.")
     except FileNotFoundError:
-        print(f"Error: The MuMu Multi-Instance executable was not found at {mumu_path}.")
+        print(f"Error: Executable not found at {mumu_path}.")
         return
     except Exception as e:
-        print(f"Error launching MuMu Multi-Instance: {str(e)}")
+        print(f"Error launching: {e}")
         return
 
     main_window = app.window(title="MuMu Multi-instance 12")
@@ -131,33 +127,24 @@ def main():
     center_y = main_window_rect.top + main_window_rect.height() // 2
     move(coords=(center_x, center_y))
 
-    # Uncomment to debug UI hierarchy
-    # list_elements_on_window(main_window)
-
-    # Start the routine to start/stop instances
-    print("Starting instance management routine...")
+    print("Starting instance management...")
     
-
-    # Main loop replacing threading.Timer
     while not global_should_stop:
         try:
             current_time = time.time()
             print(f"\nCurrent time: {time.ctime(current_time)}")
-            print(f"Last routine run: {last_routine_run}, Last routine range: {last_routine_range}")
-            # tome for next routine run
-            print(f"Time remaining for next routine run: {cycle_interval - (current_time - last_routine_run) if last_routine_run else 'N/A'} seconds")
-            print("--------------------------------------------------------")
-            if last_routine_run is None or (current_time - last_routine_run) >= cycle_interval:  # 10-minute interval
-                # Stop previous batch if it exists
+            print(f"Last run: {last_routine_run}, Range: {last_routine_range}")
+            print(f"Time remaining: {cycle_interval - (current_time - last_routine_run) if last_routine_run else 'N/A'} seconds")
+            print("-" * 60)
+            if last_routine_run is None or (current_time - last_routine_run) >= cycle_interval:
                 if last_routine_range:
-                    print(f"Stopping previous batch: {last_routine_range}")
+                    print(f"Stopping batch: {last_routine_range}")
                     start_instances_routine(main_window, vm_names, 
                                            last_routine_range[0], 
                                            last_routine_range[1], 
                                            action=SelectionActions.STOP)
-                    time.sleep(10)  # Wait for stop to complete
+                    time.sleep(10)
 
-                # Calculate new batch
                 if last_routine_range is None:
                     start_point = 1
                     end_point = min(batch_size, total_instances)
@@ -166,40 +153,32 @@ def main():
                     end_point = min(start_point + batch_size - 1, total_instances)
 
                 if start_point > total_instances:
-                    print("All instances processed. Restarting from beginning.")
+                    print("All instances processed. Restarting.")
                     start_point = 1
                     end_point = min(batch_size, total_instances)
 
-                # Start the new batch
                 start_instances_routine(main_window, vm_names, start_point, end_point, 
                                        action=SelectionActions.START)
-                # find_and_inspect_toolbar(main_window, action=SelectionActions.START)
-
                 last_routine_run = current_time
                 last_routine_range = (start_point, end_point)
 
-            # Short sleep to prevent CPU overuse and allow Ctrl+C to be processed
             time.sleep(1)
         except Exception as e:
-            print(f"Error in main loop: {str(e)}")
-            time.sleep(2)  # Prevent rapid error looping
+            print(f"Main loop error: {e}")
+            time.sleep(2)
 
-    # Cleanup before exiting
-    print("Performing cleanup...")
+    print("Cleaning up...")
     try:
         if app.is_process_running():
             app.window(title="MuMu Multi-instance 12").close()
-            print("Closed MuMu Multi-Instance window.")
+            print("Closed MuMu window.")
     except Exception as e:
-        print(f"Error during cleanup: {str(e)}")
+        print(f"Cleanup error: {e}")
     
     print("Program terminated.")
     sys.exit(0)
 
 def start_instances_routine(main_window, vm_names, start_point=1, end_point=None, action=SelectionActions.START):
-    """
-    Routine to start or stop instances in batches.
-    """
     global global_should_stop
     if global_should_stop:
         print("Termination signal received, stopping routine.")
@@ -214,18 +193,15 @@ def start_instances_routine(main_window, vm_names, start_point=1, end_point=None
 
     print(f"Processing instances {start_point} to {end_point} with action {action.name}")
 
-    # wait for the main window to be ready
     if not main_window.exists(timeout=5):
         print("Main window not found. Exiting routine.")
         return
     
     unselect_all_instances(main_window)
 
-    # Ensure the main window is focused
     main_window.set_focus()
-    time.sleep(0.5)  # Allow time for focus to settle
+    time.sleep(0.5)
 
-    # Ensure the instance list is accessible
     instance_list = main_window.child_window(class_name="PlayerListWidget", control_type="List")
     if not instance_list.exists(timeout=5):
         print("Instance list not found.")
@@ -243,7 +219,6 @@ def start_instances_routine(main_window, vm_names, start_point=1, end_point=None
         vm_name = vm_names[idx]
         print(f"Processing instance {idx + 1}: {vm_name}")
 
-        # Use search bar to locate the instance
         search_bar = main_window.child_window(control_type="Edit", class_name="SearchEdit")
         if not search_bar.exists(timeout=5):
             print("Search bar not found.")
@@ -252,12 +227,11 @@ def start_instances_routine(main_window, vm_names, start_point=1, end_point=None
         try:
             search_bar.set_focus()
             time.sleep(0.2)
-            search_bar.set_edit_text("")  # Clear existing text
+            search_bar.set_edit_text("")
             time.sleep(0.2)
-            send_keys(vm_name.upper(), with_spaces=True)
-            time.sleep(1)  # Allow search results to update
+            search_bar.set_text(vm_name.upper())
+            time.sleep(1)
 
-            # Click the checkbox of the first result
             instances = instance_list.children(control_type="ListItem")
             if instances:
                 first_instance = instances[0]
@@ -275,20 +249,15 @@ def start_instances_routine(main_window, vm_names, start_point=1, end_point=None
             print(f"Error processing {vm_name} via search bar: {str(e)}")
             continue
 
-        time.sleep(2)  # Wait before next instance
+        time.sleep(2)
 
-    # in the end will clear the search bar
     try:
-        search_bar.set_edit_text("")  # Clear the search bar after processing
+        search_bar.set_edit_text("")
         print("Cleared search bar after processing instances.")
     except Exception as e:
         print(f"Error clearing search bar: {str(e)}")
 
-    # wait 1 second before clicking the toolbar action
     time.sleep(1)
-    # Click the toolbar action (Start or Stop)
-    # click_toolbar_action(main_window, action)
-    # print(f"Finished {action.name} routine for instances {start_point} to {end_point}")
     find_and_inspect_toolbar(main_window, action=action)
     
 def click_toolbar_action(main_window, action: SelectionActions):
@@ -309,14 +278,13 @@ def click_toolbar_action(main_window, action: SelectionActions):
 
     try:
         if action == SelectionActions.START:
-            buttons[0].click_input()
+            buttons[0].click()
             print("Clicked 'Start' button in toolbar.")
         elif action == SelectionActions.STOP:
-            buttons[1].click_input()
+            buttons[1].click()
             print("Clicked 'Stop' button in toolbar. Waiting for confirmation dialog...")
-            time.sleep(2)  # Increased wait for dialog to appear
+            time.sleep(2)
 
-            # Connect to the application and find the confirmation dialog
             app = Application(backend="uia").connect(title_re=".*", timeout=5)
             dialog = app.window(class_name="NemuMessageBox")
             max_attempts = 3
@@ -325,14 +293,13 @@ def click_toolbar_action(main_window, action: SelectionActions):
             while attempt <= max_attempts:
                 if dialog.exists(timeout=5):
                     print("Confirmation dialog detected.")
-                    # Find all buttons in the dialog
                     dialog_buttons = dialog.children(control_type="Button")
                     if dialog_buttons:
-                        confirm_button = dialog_buttons[0]  # First button is "Confirm"
+                        confirm_button = dialog_buttons[0]
                         try:
-                            confirm_button.click_input()
+                            confirm_button.click()
                             print("Clicked 'Confirm' button in dialog.")
-                            time.sleep(1)  # Wait for dialog to close
+                            time.sleep(1)
                             return
                         except Exception as e:
                             print(f"Error clicking Confirm button: {str(e)}")
@@ -341,7 +308,7 @@ def click_toolbar_action(main_window, action: SelectionActions):
                 else:
                     print(f"Confirmation dialog not found on attempt {attempt}.")
                 
-                time.sleep(1)  # Wait before retrying
+                time.sleep(1)
                 attempt += 1
 
             print(f"Failed to find or click 'Confirm' button after {max_attempts} attempts.")
@@ -349,18 +316,37 @@ def click_toolbar_action(main_window, action: SelectionActions):
         print(f"Error clicking toolbar button for {action.name}: {str(e)}")
 
 def unselect_all_instances(main_window):
+    print("Attempting to unselect all instances...")
     select_all_checkbox = main_window.child_window(control_type="CheckBox", title="Select All")
-    if select_all_checkbox.exists(timeout=2):
-        select_all_checkbox.click_input()
-        print("Clicked 'Select All' checkbox to unselect all instances.")
-        time.sleep(1)
+    max_attempts = 3
+    attempt = 1
+
+    while attempt <= max_attempts:
+        try:
+            if select_all_checkbox.exists(timeout=5):
+                print("Found 'Select All' checkbox.")
+                # First click to unselect all
+                select_all_checkbox.click()
+                print("Clicked 'Select All' checkbox to unselect all instances.")
+                time.sleep(1)
+                # Second click to select all
+                select_all_checkbox.click()
+                print("Clicked 'Select All' checkbox to select all instances.")
+                time.sleep(1)
+                return True
+            else:
+                print(f"'Select All' checkbox not found on attempt {attempt}.")
+                if attempt == max_attempts:
+                    print("Debugging UI hierarchy...")
+                    list_elements_on_window(main_window)
+        except Exception as e:
+            print(f"Error interacting with 'Select All' checkbox on attempt {attempt}: {str(e)}")
         
-        select_all_checkbox.click_input()
-        print("Clicked 'Select All' checkbox to select all instances.")
-        # wait for the UI to update
-        time.sleep(1)
-    else:
-        print("'Select All' checkbox not found.")
+        time.sleep(2)
+        attempt += 1
+
+    print("Failed to find or click 'Select All' checkbox after all attempts.")
+    return False
 
 def manage_instances_searchbar(vm_names, main_window, start_point=1, end_point=None):
     """
@@ -390,7 +376,7 @@ def manage_instances_searchbar(vm_names, main_window, start_point=1, end_point=N
             time.sleep(0.2)
             search_bar.set_edit_text("")  # Clear existing text
             time.sleep(0.2)
-            send_keys(vm_name.upper(), with_spaces=True)
+            search_bar.set_text(vm_name.upper())
             time.sleep(1)  # Allow time for search results to update
 
             instance_list = main_window.child_window(class_name="PlayerListWidget", control_type="List")
@@ -419,8 +405,6 @@ def manage_instances_searchbar(vm_names, main_window, start_point=1, end_point=N
 def padronize_vm_names(vm_name_prefix, mumu_base_path) -> list[str]:
     import os
     import json
-    # vm_dir = r"D:\Program Files\Netease\MuMuPlayerGlobal-12.0\vms"
-    # D:\Program Files\Netease\MuMuPlayerGlobal-12.0\vms will extract this part from the
     vm_dir = os.path.join(mumu_base_path, "vms")
     vm_names = []
     used_names = set()
@@ -433,9 +417,16 @@ def padronize_vm_names(vm_name_prefix, mumu_base_path) -> list[str]:
                 used_names.add(name)
                 return name
 
+    if not os.path.isdir(vm_dir):
+        print(f"Error: VM directory not found at {vm_dir}. Please check MuMu installation.")
+        return vm_names
+
+    found_valid_dir = False
     for dir_name in os.listdir(vm_dir):
         dir_path = os.path.join(vm_dir, dir_name)
-        if not os.path.isdir(dir_path) or not dir_name.startswith("MuMuPlayerGlobal-12.0-"):
+        # Skip non-VM directories (e.g., MuMuPlayerGlobal-12.0-base)
+        if not os.path.isdir(dir_path) or not dir_name.startswith("MuMuPlayerGlobal-12.0-") or "base" in dir_name.lower():
+            print(f"Skipping directory: {dir_path} (not a valid VM directory)")
             continue
 
         config_path = os.path.join(dir_path, "configs")
@@ -444,6 +435,7 @@ def padronize_vm_names(vm_name_prefix, mumu_base_path) -> list[str]:
             print(f"No config file found: {config_file}")
             continue
 
+        found_valid_dir = True
         print(f"Found config file: {config_file}")
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
@@ -458,6 +450,14 @@ def padronize_vm_names(vm_name_prefix, mumu_base_path) -> list[str]:
             print(f"Error reading JSON from {config_file}: {str(e)}")
         except Exception as e:
             print(f"Error updating {config_file}: {str(e)}")
+
+    if not found_valid_dir:
+        print("Warning: No valid VM directories found. Please create VMs in MuMu Multi-Instance Manager.")
+        # Optional: Prompt user to continue with a default VM name for testing
+        create_default = input("No VMs found. Use a default VM name for testing? (y/n): ").strip().lower()
+        if create_default == 'y':
+            vm_names.append(generate_unique_name())
+            print(f"Added default VM name: {vm_names[0]}")
 
     return vm_names
 
@@ -570,116 +570,8 @@ def list_elements_on_window(window):
     print("\nListing all controls in the MuMu Multi-Instance window with detailed properties:")
     print_detailed_tree(window)
 
-def scroll_instance_list(instance_list, direction="down", amount=2):
-    """
-    Scroll the instance list by sending Page Up/Down keys after focusing the list.
-    Handles focus issues by attempting multiple focus methods and verifying focus.
-    Args:
-        instance_list: The list control to scroll
-        direction: "up" or "down"
-        amount: Number of Page Up/Down key presses (default 2 as per user observation)
-    """
-    print(f"Attempting to scroll instance list {direction}...")
-
-    # Helper function to verify if the control is focused
-    def is_control_focused(control):
-        try:
-            return control.has_focus() or control.is_active()
-        except Exception:
-            return False
-
-    # Attempt to focus the instance list
-    focused = False
-    try:
-        instance_list.set_focus()
-        time.sleep(0.2)  # Small delay to ensure focus is set
-        if is_control_focused(instance_list):
-            focused = True
-            print("Successfully focused instance list using set_focus()")
-        else:
-            print("set_focus() executed but control not focused")
-    except Exception as e:
-        print(f"set_focus() failed: {str(e)}")
-
-    # Fallback: Click the list to focus it
-    if not focused:
-        print("Attempting to focus by clicking the list...")
-        try:
-            list_rect = instance_list.rectangle()
-            if list_rect:
-                center_x = list_rect.left + list_rect.width() // 2
-                center_y = list_rect.top + list_rect.height() // 2
-                
-
-                click(coords=(center_x, center_y))
-                time.sleep(0.2)
-                if is_control_focused(instance_list):
-                    focused = True
-                    print(f"Successfully focused instance list by clicking at ({center_x}, {center_y})")
-                else:
-                    print("Click executed but control not focused")
-            else:
-                print("Could not get list rectangle for clicking")
-        except Exception as e:
-            print(f"Click to focus failed: {str(e)}")
-
-    # Final fallback: Try focusing the parent window
-    if not focused:
-        print("Attempting to focus parent window...")
-        try:
-            parent = instance_list.parent()
-            if parent and parent.is_enabled() and parent.is_visible():
-                parent.set_focus()
-                time.sleep(0.2)
-                if is_control_focused(parent) or is_control_focused(instance_list):
-                    focused = True
-                    print("Successfully focused parent window")
-                else:
-                    print("Parent window focus executed but control not focused")
-            else:
-                print("Parent window not valid for focusing")
-        except Exception as e:
-            print(f"Parent window focus failed: {str(e)}")
-
-    # Proceed with scrolling if focused, or attempt anyway with warning
-    if not focused:
-        print("Warning: Could not verify focus, attempting scroll anyway...")
-
-    try:
-        # Send Page Down or Page Up keys based on direction
-        key = "{PGDN}" if direction == "down" else "{PGUP}"
-        for _ in range(amount):
-            send_keys(key)
-            time.sleep(0.1)  # Small delay between key presses
-        print(f"Successfully scrolled using {key} key ({direction}, {amount} steps)")
-        time.sleep(0.5)  # Allow time for UI to update
-        return True
-    except Exception as e:
-        print(f"Page {direction} key scroll method failed: {str(e)}")
-
-    # Fallback: Try UIA Scroll Pattern
-    print("Falling back to UIA Scroll Pattern...")
-    try:
-        element = instance_list.element_info
-        scroll_pattern = element.get_current_pattern(10016)  # ScrollPattern ID
-        if scroll_pattern:
-            scroll_amount = 1 if direction == "down" else -1
-            for _ in range(amount):
-                scroll_pattern.scroll(0, scroll_amount)
-                time.sleep(0.1)
-            print(f"Successfully scrolled using UIA Scroll Pattern ({direction}, {amount} steps)")
-            return True
-        else:
-            print("UIA Scroll Pattern not available")
-    except Exception as e:
-        print(f"UIA Scroll Pattern failed: {str(e)}")
-
-    print("All scroll methods failed")
-    return False
-
 def find_and_inspect_toolbar(window, action=SelectionActions.START):
     print("\nSearching for toolbar...")
-
     all_groups = window.descendants(control_type="Group")
     toolbar = None
     
@@ -750,26 +642,24 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
             if idx == 0:
                 logical_name = "START (first button)"
                 if action == SelectionActions.START:
-                    button.click_input()
+                    button.click()
             elif idx == 1:
                 logical_name = "STOP (second button)"
                 if action == SelectionActions.STOP:
-                    button.click_input()
+                    button.click()
                     print("Clicked 'Stop' button. Waiting for confirmation dialog...")
-                    time.sleep(6)  # Increased wait time
+                    time.sleep(6)
 
-                    # Debug: List all elements to confirm dialog presence
                     list_elements_on_window(window)
                     print("Searching for dialog in current window hierarchy...")
                     dialogs = window.descendants(class_name="NemuMessageBox")
                     if dialogs:
                         dialog = dialogs[0]
 
-                        # Recursively search for the first NemuPushButton7 and click it
                         def find_and_click_pushbutton7(control):
                             if control.element_info.class_name == "NemuUiLib::NemuPushButton7":
                                 try:
-                                    control.click_input()
+                                    control.click()
                                     print("Clicked the first NemuPushButton7 in the dialog.")
                                     return True
                                 except Exception as e:
@@ -792,15 +682,15 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
                     while attempt <= max_attempts:
                         if dialog.exists(timeout=5):
                             print("Confirmation dialog detected.")
-                            dialog.set_focus()  # Ensure dialog is focused
+                            dialog.set_focus()
                             dialog_buttons = dialog.children(control_type="Button")
                             if dialog_buttons:
-                                confirm_button = dialog_buttons[0]  # First button is "Confirm"
+                                confirm_button = dialog_buttons[0]
                                 if confirm_button.is_enabled() and confirm_button.is_visible():
                                     try:
-                                        confirm_button.click_input()
+                                        confirm_button.click()
                                         print("Clicked 'Confirm' button in dialog.")
-                                        time.sleep(1)  # Wait for dialog to close
+                                        time.sleep(1)
                                         return
                                     except Exception as e:
                                         print(f"Error clicking Confirm button: {str(e)}. Retrying...")
@@ -811,7 +701,7 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
                         else:
                             print(f"Confirmation dialog not found on attempt {attempt}.")
                         
-                        time.sleep(1)  # Wait before retrying
+                        time.sleep(1)
                         attempt += 1
 
                     print(f"Failed to find or click 'Confirm' button after {max_attempts} attempts.")
@@ -830,7 +720,7 @@ def find_and_inspect_toolbar(window, action=SelectionActions.START):
             print("-" * 40)
         except Exception as e:
             print(f"Error inspecting button {idx + 1}: {str(e)}")
-            continue  # Continue to the next button despite the error
+            continue
 
 def analyze_instance_state(instance_row, index, main_window):
     """
