@@ -1,411 +1,75 @@
-import ctypes
-from ctypes import wintypes
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+import subprocess
 import threading
 import time
 import signal
 import sys
-from pywinauto import Application
-from pywinauto.mouse import click, move
-from pywinauto.timings import Timings
+import tkinter as tk
+from tkinter import ttk
 import random
 import string
-import enum
-import win32con
+from datetime import datetime, timezone, timedelta
+import queue
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# Increase default timeout
-Timings.window_find_timeout = 10.0  # Increased for reliability
-
-class SelectionActions(enum.Enum):
-    START = 1
-    STOP = 2
-
-class SelectionPoints(enum.Enum):
-    FROM_START = 1
-    TO_END = 2
-    FROM_MID = 3
-    TO_START = 4
-    TO_MID = 5
+class SelectionActions:
+    START = "launch"
+    STOP = "shutdown"
 
 global_should_stop = False
+is_cycling = False
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C and other termination signals."""
     global global_should_stop
-    print("\nReceived Ctrl+C, stopping gracefully...")
+    print("\nRecebido Ctrl+C, encerrando graciosamente...")
     global_should_stop = True
 
-def main():
-    global global_should_stop
+def get_vm_info(mumu_base_path):
+    """Get VM information by querying MuMuManager info for indices 0 to 20 in parallel."""
+    start_time = time.time()
+    mumu_manager = os.path.join(mumu_base_path, "shell", "MuMuManager.exe")
+    vm_info = []
+    indices = range(21)
 
-    last_path_file = "last_mumu_path.json"
-    mumu_base_path = None
-    cycle_interval = 480
-    
-    try:
-        with open(last_path_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        prev_path = data.get("mumu_base_path", "").strip()
-        if prev_path and os.path.isdir(prev_path):
-            print(f"Previously used MuMu installation path: {prev_path}")
-            choice = input("Use path? (0: reuse, 1: change path):").strip()
-            if choice == "0":
-                mumu_base_path = prev_path
-                mumu_path = os.path.join(prev_path, "shell", "MuMuMultiPlayer.exe")
-    except Exception as e:
-        print(f"Could not load previous path: {e}")
-
-    while not mumu_base_path:
-        mumu_base_path = input(
-            "Enter MuMu installation path (e.g., D:\\Program Files\\Netease\\MuMuPlayerGlobal-12.0):\n> "
-        ).strip('"').strip()
-        if not mumu_base_path:
-            print("Path cannot be empty.")
-            continue
-        if not os.path.isdir(mumu_base_path):
-            print(f"Directory not found: {mumu_base_path}")
-            mumu_base_path = None
-            continue
-        mumu_path = os.path.join(mumu_base_path, "shell", "MuMuMultiPlayer.exe")
-        if not os.path.exists(mumu_path):
-            print(f"MuMuMultiPlayer.exe not found: {mumu_path}")
-            mumu_base_path = None
-            continue
+    def query_vm(index):
         try:
-            with open(last_path_file, "w", encoding="utf-8") as f:
-                json.dump({"mumu_base_path": mumu_base_path}, f)
-            print(f"Saved path to {last_path_file}")
-        except Exception as e:
-            print(f"Could not save path: {e}")
-        break
+            result = subprocess.run(
+                [mumu_manager, "info", "-v", str(index)],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            vm_data = json.loads(result.stdout)
+            if vm_data.get("error_code", -1) == 0:
+                status = "running" if vm_data.get("is_android_started", False) else "stopped"
+                return {
+                    "index": vm_data["index"],
+                    "name": vm_data["name"],
+                    "status": status,
+                    "is_main": vm_data.get("is_main", False)
+                }
+            return None
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            return None
 
-    print(f"Using MuMu executable: {mumu_path}")
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_index = {executor.submit(query_vm, i): i for i in indices}
+        for future in as_completed(future_to_index):
+            result = future.result()
+            if result:
+                vm_info.append(result)
 
-    vm_base_name = "ROM_"
-    print("Scanning for VM names...")
-    vm_names = padronize_vm_names(vm_base_name, mumu_base_path)
-    print(f"Found {len(vm_names)} VM(s): {vm_names}")
-    last_routine_run = None
-    last_routine_range = None
-    batch_size = int(input("Enter batch size: "))
-    total_instances = len(vm_names)
-    
-    if not vm_names:
-        print("Error: No VM names found. Please create VMs in MuMu Multi-Instance Manager.")
-        return
+    vm_info.sort(key=lambda x: x['index'])  # Sort by index for consistent order
+    print(f"Tempo decorrido: {time.time() - start_time} segundos")
+    return vm_info if vm_info else []
 
-    signal.signal(signal.SIGINT, signal_handler)
-
-    try:
-        app = Application(backend="uia").connect(title="MuMu Multi-instance 12", timeout=5)
-        print("MuMu Multi-Instance running. Closing...")
-        app.window(title="MuMu Multi-instance 12").close()
-        time.sleep(2)
-    except Exception:
-        print("MuMu Multi-Instance not running.")
-
-    print("Launching program...")
-    try:
-        os.startfile(mumu_path)
-        print("Program launched. Waiting 10 seconds...")
-        time.sleep(10)
-        app = Application(backend="uia").connect(title="MuMu Multi-instance 12", timeout=10)
-        print("MuMu Multi-Instance window open.")
-    except FileNotFoundError:
-        print(f"Error: Executable not found at {mumu_path}.")
-        return
-    except Exception as e:
-        print(f"Error launching: {e}")
-        return
-
-    main_window = app.window(title="MuMu Multi-instance 12")
-    main_window.set_focus()
-
-    # main_window_rect = main_window.rectangle()
-    # center_x = main_window_rect.left + main_window_rect.width() // 2
-    # center_y = main_window_rect.top + main_window_rect.height() // 2
-    # move(coords=(center_x, center_y))
-
-    print("Starting instance management...")
-    
-    while not global_should_stop:
-        try:
-            current_time = time.time()
-            print(f"\nCurrent time: {time.ctime(current_time)}")
-            print(f"Last run: {last_routine_run}, Range: {last_routine_range}")
-            print(f"Time remaining: {cycle_interval - (current_time - last_routine_run) if last_routine_run else 'N/A'} seconds")
-            print("-" * 60)
-            if last_routine_run is None or (current_time - last_routine_run) >= cycle_interval:
-                if last_routine_range:
-                    print(f"Stopping batch: {last_routine_range}")
-                    start_instances_routine(main_window, vm_names, 
-                                           last_routine_range[0], 
-                                           last_routine_range[1], 
-                                           action=SelectionActions.STOP)
-                    time.sleep(10)
-
-                if last_routine_range is None:
-                    start_point = 1
-                    end_point = min(batch_size, total_instances)
-                else:
-                    start_point = last_routine_range[1] + 1
-                    end_point = min(start_point + batch_size - 1, total_instances)
-
-                if start_point > total_instances:
-                    print("All instances processed. Restarting.")
-                    start_point = 1
-                    end_point = min(batch_size, total_instances)
-
-                start_instances_routine(main_window, vm_names, start_point, end_point, 
-                                       action=SelectionActions.START)
-                last_routine_run = current_time
-                last_routine_range = (start_point, end_point)
-
-            time.sleep(1)
-        except Exception as e:
-            print(f"Main loop error: {e}")
-            time.sleep(2)
-
-    print("Cleaning up...")
-    try:
-        if app.is_process_running():
-            app.window(title="MuMu Multi-instance 12").close()
-            print("Closed MuMu window.")
-    except Exception as e:
-        print(f"Cleanup error: {e}")
-    
-    print("Program terminated.")
-    sys.exit(0)
-
-def start_instances_routine(main_window, vm_names, start_point=1, end_point=None, action=SelectionActions.START):
-    global global_should_stop
-    if global_should_stop:
-        print("Termination signal received, stopping routine.")
-        return
-
-    if not vm_names:
-        print("Error: No VM names provided.")
-        return
-
-    if end_point is None:
-        end_point = len(vm_names)
-
-    print(f"Processing instances {start_point} to {end_point} with action {action.name}")
-
-    if not main_window.exists(timeout=5):
-        print("Main window not found. Exiting routine.")
-        return
-    
-    unselect_all_instances(main_window)
-
-    main_window.set_focus()
-    time.sleep(0.5)
-
-    instance_list = main_window.child_window(class_name="PlayerListWidget", control_type="List")
-    if not instance_list.exists(timeout=5):
-        print("Instance list not found.")
-        return
-
-    for idx in range(start_point - 1, end_point):
-        if global_should_stop:
-            print("Termination signal received, stopping routine.")
-            return
-
-        if idx >= len(vm_names):
-            print(f"Reached end of VM names at index {idx}. Stopping.")
-            break
-
-        vm_name = vm_names[idx]
-        print(f"Processing instance {idx + 1}: {vm_name}")
-
-        search_bar = main_window.child_window(control_type="Edit", class_name="SearchEdit")
-        if not search_bar.exists(timeout=5):
-            print("Search bar not found.")
-            continue
-
-        try:
-            search_bar.set_focus()
-            time.sleep(0.2)
-            search_bar.set_edit_text("")
-            time.sleep(0.2)
-            search_bar.set_text(vm_name.upper())
-            time.sleep(1)
-
-            instances = instance_list.children(control_type="ListItem")
-            if instances:
-                first_instance = instances[0]
-                row_rect = first_instance.rectangle()
-                if row_rect:
-                    checkbox_x = row_rect.left + 36 + 15
-                    checkbox_y = row_rect.top + 28
-                    click(coords=(checkbox_x, checkbox_y))
-                    print(f"Clicked checkbox for instance: {vm_name}")
-                else:
-                    print(f"Could not get rectangle for instance: {vm_name}")
-            else:
-                print(f"No instances found for VM: {vm_name}")
-        except Exception as e:
-            print(f"Error processing {vm_name} via search bar: {str(e)}")
-            continue
-
-        time.sleep(2)
-
-    try:
-        search_bar.set_edit_text("")
-        print("Cleared search bar after processing instances.")
-    except Exception as e:
-        print(f"Error clearing search bar: {str(e)}")
-
-    time.sleep(1)
-    find_and_inspect_toolbar(main_window, action=action)
-    
-def click_toolbar_action(main_window, action: SelectionActions):
-    global global_should_stop
-    if global_should_stop:
-        print("Termination signal received, skipping toolbar action.")
-        return
-
-    toolbar = main_window.child_window(control_type="Group", class_name="QWidget")
-    if not toolbar.exists(timeout=5):
-        print("Toolbar not found.")
-        return
-
-    buttons = toolbar.children(control_type="Button")
-    if not buttons or len(buttons) < 2:
-        print("Not enough buttons found in toolbar.")
-        return
-
-    try:
-        if action == SelectionActions.START:
-            buttons[0].click()
-            print("Clicked 'Start' button in toolbar.")
-        elif action == SelectionActions.STOP:
-            buttons[1].click()
-            print("Clicked 'Stop' button in toolbar. Waiting for confirmation dialog...")
-            time.sleep(2)
-
-            app = Application(backend="uia").connect(title_re=".*", timeout=5)
-            dialog = app.window(class_name="NemuMessageBox")
-            max_attempts = 3
-            attempt = 1
-
-            while attempt <= max_attempts:
-                if dialog.exists(timeout=5):
-                    print("Confirmation dialog detected.")
-                    dialog_buttons = dialog.children(control_type="Button")
-                    if dialog_buttons:
-                        confirm_button = dialog_buttons[0]
-                        try:
-                            confirm_button.click()
-                            print("Clicked 'Confirm' button in dialog.")
-                            time.sleep(1)
-                            return
-                        except Exception as e:
-                            print(f"Error clicking Confirm button: {str(e)}")
-                    else:
-                        print("No buttons found in dialog.")
-                else:
-                    print(f"Confirmation dialog not found on attempt {attempt}.")
-                
-                time.sleep(1)
-                attempt += 1
-
-            print(f"Failed to find or click 'Confirm' button after {max_attempts} attempts.")
-    except Exception as e:
-        print(f"Error clicking toolbar button for {action.name}: {str(e)}")
-
-def unselect_all_instances(main_window):
-    print("Attempting to unselect all instances...")
-    select_all_checkbox = main_window.child_window(control_type="CheckBox", title="Select All")
-    max_attempts = 3
-    attempt = 1
-
-    while attempt <= max_attempts:
-        try:
-            if select_all_checkbox.exists(timeout=5):
-                print("Found 'Select All' checkbox.")
-                # First click to unselect all
-                select_all_checkbox.click()
-                print("Clicked 'Select All' checkbox to unselect all instances.")
-                time.sleep(1)
-                # Second click to select all
-                select_all_checkbox.click()
-                print("Clicked 'Select All' checkbox to select all instances.")
-                time.sleep(1)
-                return True
-            else:
-                print(f"'Select All' checkbox not found on attempt {attempt}.")
-                if attempt == max_attempts:
-                    print("Debugging UI hierarchy...")
-                    list_elements_on_window(main_window)
-        except Exception as e:
-            print(f"Error interacting with 'Select All' checkbox on attempt {attempt}: {str(e)}")
-        
-        time.sleep(2)
-        attempt += 1
-
-    print("Failed to find or click 'Select All' checkbox after all attempts.")
-    return False
-
-def manage_instances_searchbar(vm_names, main_window, start_point=1, end_point=None):
-    """
-    Start searching for instances in the search bar and select them.
-    """
-    search_bar = main_window.child_window(control_type="Edit", class_name="SearchEdit")
-    if not search_bar.exists(timeout=5):
-        print("Search bar not found.")
-        return
-
-    # make sure the window is focused
-    main_window.set_focus()
-
-    print("Starting instance selection process...")
-    for idx, vm_name in enumerate(vm_names):
-        if end_point is not None and idx >= end_point:
-            print(f"Reached end point at index {idx}. Stopping further searches.")
-            break
-
-        if start_point is not None and idx < start_point - 1:
-            print(f"Skipping index {idx} as it is below the start point {start_point}.")
-            continue
-
-        print(f"Searching for VM {idx + 1}: {vm_name.upper()}")
-        try:
-            search_bar.set_focus()
-            time.sleep(0.2)
-            search_bar.set_edit_text("")  # Clear existing text
-            time.sleep(0.2)
-            search_bar.set_text(vm_name.upper())
-            time.sleep(1)  # Allow time for search results to update
-
-            instance_list = main_window.child_window(class_name="PlayerListWidget", control_type="List")
-            if instance_list.exists():
-                instances = instance_list.children(control_type="ListItem")
-                if instances:
-                    first_instance = instances[0]
-                    row_rect = first_instance.rectangle()
-                    if row_rect:
-                        checkbox_x = row_rect.left + 36 + 15
-                        checkbox_y = row_rect.top + 28
-                        click(coords=(checkbox_x, checkbox_y))
-                        print(f"Clicked checkbox for instance: {vm_name}")
-                    else:
-                        print(f"Could not get rectangle for first instance of VM: {vm_name}")
-                else:
-                    print(f"No instances found for VM: {vm_name}")
-            else:
-                print("Instance list not found.")
-        except Exception as e:
-            print(f"Error focusing or typing in search bar: {e}")
-            continue
-
-        time.sleep(1)
-
-def padronize_vm_names(vm_name_prefix, mumu_base_path) -> list[str]:
-    import os
-    import json
-    vm_dir = os.path.join(mumu_base_path, "vms")
+def padronize_vm_names(vm_name_prefix, mumu_base_path):
+    """Standardize VM names, skipping main VM (index 0)."""
+    mumu_manager = os.path.join(mumu_base_path, "shell", "MuMuManager.exe")
     vm_names = []
     used_names = set()
 
@@ -417,431 +81,722 @@ def padronize_vm_names(vm_name_prefix, mumu_base_path) -> list[str]:
                 used_names.add(name)
                 return name
 
-    if not os.path.isdir(vm_dir):
-        print(f"Error: VM directory not found at {vm_dir}. Please check MuMu installation.")
+    vm_info = get_vm_info(mumu_base_path)
+    if not vm_info:
+        print("Aviso: Nenhuma VM válida encontrada. Crie VMs no Gerenciador de Instâncias Múltiplas do MuMu.")
         return vm_names
 
-    found_valid_dir = False
-    for dir_name in os.listdir(vm_dir):
-        dir_path = os.path.join(vm_dir, dir_name)
-        # Skip non-VM directories (e.g., MuMuPlayerGlobal-12.0-base)
-        if not os.path.isdir(dir_path) or not dir_name.startswith("MuMuPlayerGlobal-12.0-") or "base" in dir_name.lower():
-            print(f"Skipping directory: {dir_path} (not a valid VM directory)")
+    for vm in vm_info:
+        current_name = vm["name"]
+        if vm["is_main"]:
+            print(f"Ignorando renomeação para VM principal {vm['index']}: {current_name}")
+            vm_names.append(current_name)
+            used_names.add(current_name)
             continue
-
-        config_path = os.path.join(dir_path, "configs")
-        config_file = os.path.join(config_path, "extra_config.json")
-        if not os.path.exists(config_file):
-            print(f"No config file found: {config_file}")
-            continue
-
-        found_valid_dir = True
-        print(f"Found config file: {config_file}")
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config_data = json.load(f)
-                new_player_name = generate_unique_name()
-                config_data["playerName"] = new_player_name
-                with open(config_file, 'w', encoding='utf-8') as f2:
-                    json.dump(config_data, f2, indent=2, ensure_ascii=False)
-                vm_names.append(new_player_name)
-                print(f"Updated and set unique VM name: {new_player_name}")
-        except json.JSONDecodeError as e:
-            print(f"Error reading JSON from {config_file}: {str(e)}")
-        except Exception as e:
-            print(f"Error updating {config_file}: {str(e)}")
-
-    if not found_valid_dir:
-        print("Warning: No valid VM directories found. Please create VMs in MuMu Multi-Instance Manager.")
-        # Optional: Prompt user to continue with a default VM name for testing
-        create_default = input("No VMs found. Use a default VM name for testing? (y/n): ").strip().lower()
-        if create_default == 'y':
-            vm_names.append(generate_unique_name())
-            print(f"Added default VM name: {vm_names[0]}")
-
-    return vm_names
-
-def get_detailed_scroll_info(control):
-    """
-    Get detailed scrolling information for a control
-    """
-    scroll_info = {
-        'is_scrollable': False,
-        'scroll_patterns': [],
-        'scroll_methods_available': [],
-        'scroll_bars': {'horizontal': False, 'vertical': False},
-        'error': None
-    }
-    
-    try:
-        # Check basic scrollable property
-        scroll_info['is_scrollable'] = control.is_scrollable()
-        
-        # Try to get UIA patterns for scrolling
-        try:
-            element = control.element_info
-            # Check for scroll pattern
-            if hasattr(element, 'get_current_pattern'):
-                try:
-                    scroll_pattern = element.get_current_pattern(10016)  # ScrollPattern ID
-                    if scroll_pattern:
-                        scroll_info['scroll_patterns'].append('ScrollPattern')
-                        # Get scroll properties
-                        try:
-                            h_scrollable = scroll_pattern.current_horizontally_scrollable
-                            v_scrollable = scroll_pattern.current_vertically_scrollable
-                            scroll_info['scroll_bars']['horizontal'] = h_scrollable
-                            scroll_info['scroll_bars']['vertical'] = v_scrollable
-                        except:
-                            pass
-                except:
-                    pass
-        except Exception as e:
-            scroll_info['error'] = f"Pattern check error: {str(e)}"
-        
-        # Check for scroll methods availability
-        scroll_methods = ['scroll', 'scroll_mouse', 'wheel_mouse_input']
-        for method in scroll_methods:
-            if hasattr(control, method):
-                scroll_info['scroll_methods_available'].append(method)
-        
-        # Look for scroll bar controls as children
-        try:
-            scrollbars = control.descendants(control_type="ScrollBar")
-            if scrollbars:
-                for sb in scrollbars:
-                    sb_name = sb.window_text() or sb.element_info.automation_id or "Unknown"
-                    orientation = "horizontal" if "horizontal" in sb_name.lower() else "vertical"
-                    scroll_info['scroll_bars'][orientation] = True
-        except:
-            pass
-            
-    except Exception as e:
-        scroll_info['error'] = f"General error: {str(e)}"
-    
-    return scroll_info
-
-def list_elements_on_window(window):
-    def print_detailed_tree(control, depth=0):
-        indent = "  " * depth
-        # Gather detailed properties
-        control_type = control.element_info.control_type or "[No ControlType]"
-        control_name = control.window_text() or "[No Name]"
-        automation_id = control.element_info.automation_id or "[No AutomationId]"
-        class_name = control.element_info.class_name or "[No ClassName]"
-        rectangle = control.rectangle() if control.rectangle() else "[No Rectangle]"
-        enabled = "Enabled" if control.is_enabled() else "Disabled"
-        visible = "Visible" if control.is_visible() else "Hidden"
-
-        # Print inline summary
-        print(f"{indent}- {control_type} | Name: '{control_name}' | Class: {class_name} | AutomationId: {automation_id} | Rect: {rectangle} | {enabled} | {visible}")
-
-        # Get detailed scroll information
-        scroll_info = get_detailed_scroll_info(control)
-        if scroll_info['is_scrollable']:
-            print(f"{indent}  [Scrollable] Patterns: {', '.join(scroll_info['scroll_patterns'])} | Methods: {', '.join(scroll_info['scroll_methods_available'])} | ScrollBars: H={scroll_info['scroll_bars']['horizontal']} V={scroll_info['scroll_bars']['vertical']}")
-        if scroll_info['error']:
-            print(f"{indent}  [Scroll Debug Error] {scroll_info['error']}")
-
-        # Special handling for List controls
-        if control_type == "List":
-            print(f"{indent}  *** LIST CONTROL DETECTED ***")
-            print(f"{indent}  List Items Count: {len(control.children())}")
+        if not current_name.startswith(vm_name_prefix):
+            new_name = generate_unique_name()
             try:
-                list_rect = control.rectangle()
-                if list_rect:
-                    print(f"{indent}  List Dimensions: {list_rect.width()}x{list_rect.height()}")
-                scrollbars = control.descendants(control_type="ScrollBar")
-                if scrollbars:
-                    print(f"{indent}  Found {len(scrollbars)} scroll bars in list")
-                    for i, sb in enumerate(scrollbars):
-                        sb_rect = sb.rectangle()
-                        sb_orientation = "Horizontal" if sb_rect and sb_rect.width() > sb_rect.height() else "Vertical"
-                        print(f"{indent}    ScrollBar {i+1}: {sb_orientation}, Rect: {sb_rect}")
-                else:
-                    print(f"{indent}  No scroll bars found in list")
-            except Exception as e:
-                print(f"{indent}  List analysis error: {str(e)}")
+                subprocess.run(
+                    [mumu_manager, "rename", "-v", vm["index"], new_name],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                vm_names.append(new_name)
+                print(f"Renomeada VM {vm['index']} para {new_name}")
+            except subprocess.CalledProcessError as e:
+                print(f"Erro ao renomear VM {vm['index']}: {e}")
+        else:
+            vm_names.append(current_name)
+            used_names.add(current_name)
 
-        # Recursively process children
-        for child in control.children():
-            print_detailed_tree(child, depth + 1)
+    return sorted(vm_names)
 
-    print("\nListing all controls in the MuMu Multi-Instance window with detailed properties:")
-    print_detailed_tree(window)
-
-def find_and_inspect_toolbar(window, action=SelectionActions.START):
-    print("\nSearching for toolbar...")
-    all_groups = window.descendants(control_type="Group")
-    toolbar = None
-    
-    window.set_focus()
-
-    for group in all_groups:
-        rect = group.rectangle()
-        if not rect:
-            continue
-        if rect.top >= 800 and rect.bottom <= 900:
-            buttons = group.children(control_type="Button")
-            if len(buttons) >= 5:
-                toolbar = group
-                print(f"Found toolbar at rectangle: {rect}")
-                print(f"Toolbar contains {len(buttons)} buttons")
-                break
-
-    if not toolbar:
-        print("Toolbar not found. Searching more broadly...")
-        for group in all_groups:
-            buttons = group.children(control_type="Button")
-            if len(buttons) >= 6:
-                toolbar = group
-                rect = group.rectangle()
-                print(f"Found toolbar candidate at rectangle: {rect}")
-                print(f"Toolbar contains {len(buttons)} buttons")
-                break
-
-    if not toolbar:
-        print("Toolbar still not found. Let me try a different approach...")
+def control_instances(mumu_manager, vm_indices, action):
+    """Control VM instances one at a time using MuMuManager."""
+    if not vm_indices:
+        print("Nenhum índice de VM fornecido para controle.")
+        return False
+    success = True
+    for idx in vm_indices:
         try:
-            main_container = window.child_window(class_name="QWidget")
-            if main_container.exists():
-                groups = main_container.descendants(control_type="Group")
-                for group in reversed(groups):
-                    buttons = group.children(control_type="Button")
-                    if len(buttons) >= 5:
-                        toolbar = group
-                        rect = group.rectangle() if group.rectangle() else "Unknown"
-                        print(f"Found toolbar using alternative method at: {rect}")
-                        break
-        except Exception as e:
-            print(f"Error in alternative search: {e}")
+            subprocess.run(
+                [mumu_manager, "control", action, "-v", str(idx)],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            print(f"Executado com sucesso {action} para VM {idx}")
+        except subprocess.CalledProcessError as e:
+            print(f"Erro ao executar {action} para VM {idx}: {e}")
+            success = False
+    return success
 
-    if not toolbar:
-        print("Toolbar could not be found using any method.")
-        return
-
-    print(f"\nInspecting toolbar buttons...")
-    buttons = toolbar.children(control_type="Button")
-
-    if not buttons:
-        print("No buttons found in toolbar.")
-        return
-
-    print(f"Found {len(buttons)} buttons in toolbar:")
-    print("-" * 80)
-
-    for idx, button in enumerate(buttons):
-        try:
-            button_rect = button.rectangle()
-            button_name = button.window_text() or f"Button_{idx}"
-            button_class = button.element_info.class_name or "[No ClassName]"
-            automation_id = button.element_info.automation_id or "[No AutomationId]"
-            is_enabled = button.is_enabled()
-            is_visible = button.is_visible()
-
-            if idx == 0:
-                logical_name = "START (first button)"
-                if action == SelectionActions.START:
-                    button.click()
-            elif idx == 1:
-                logical_name = "STOP (second button)"
-                if action == SelectionActions.STOP:
-                    button.click()
-                    print("Clicked 'Stop' button. Waiting for confirmation dialog...")
-                    time.sleep(6)
-
-                    list_elements_on_window(window)
-                    print("Searching for dialog in current window hierarchy...")
-                    dialogs = window.descendants(class_name="NemuMessageBox")
-                    if dialogs:
-                        dialog = dialogs[0]
-
-                        def find_and_click_pushbutton7(control):
-                            if control.element_info.class_name == "NemuUiLib::NemuPushButton7":
-                                try:
-                                    control.click()
-                                    print("Clicked the first NemuPushButton7 in the dialog.")
-                                    return True
-                                except Exception as e:
-                                    print(f"Error clicking NemuPushButton7: {e}")
-                                    return False
-                            for child in control.children():
-                                if find_and_click_pushbutton7(child):
-                                    return True
-                            return False
-
-                        if not find_and_click_pushbutton7(dialog):
-                            print("NemuPushButton7 not found or could not be clicked.")
-                    else:
-                        print("No NemuMessageBox found in current window hierarchy.")
-                        return
-
-                    max_attempts = 5
-                    attempt = 1
-
-                    while attempt <= max_attempts:
-                        if dialog.exists(timeout=5):
-                            print("Confirmation dialog detected.")
-                            dialog.set_focus()
-                            dialog_buttons = dialog.children(control_type="Button")
-                            if dialog_buttons:
-                                confirm_button = dialog_buttons[0]
-                                if confirm_button.is_enabled() and confirm_button.is_visible():
-                                    try:
-                                        confirm_button.click()
-                                        print("Clicked 'Confirm' button in dialog.")
-                                        time.sleep(1)
-                                        return
-                                    except Exception as e:
-                                        print(f"Error clicking Confirm button: {str(e)}. Retrying...")
-                                else:
-                                    print("Confirm button not enabled or visible.")
-                            else:
-                                print("No buttons found in dialog.")
-                        else:
-                            print(f"Confirmation dialog not found on attempt {attempt}.")
-                        
-                        time.sleep(1)
-                        attempt += 1
-
-                    print(f"Failed to find or click 'Confirm' button after {max_attempts} attempts.")
-            else:
-                logical_name = ""
-
-            print(f"Button {idx + 1}: {logical_name}")
-            print(f"  Name: {button_name}")
-            print(f"  Class: {button_class}")
-            print(f"  AutomationId: {automation_id}")
-            print(f"  Rectangle: {button_rect}")
-            print(f"  Enabled: {'Yes' if is_enabled else 'No'}")
-            print(f"  Visible: {'Yes' if is_visible else 'No'}")
-            print(f"  Position: ({button_rect.left}, {button_rect.top})" if button_rect else "Unknown")
-            print(f"  Size: {button_rect.width()}x{button_rect.height()}" if button_rect else "Unknown")
-            print("-" * 40)
-        except Exception as e:
-            print(f"Error inspecting button {idx + 1}: {str(e)}")
-            continue
-
-def analyze_instance_state(instance_row, index, main_window):
-    """
-    Analyze the state of a MuMu instance to determine if it's running and if checkbox is checked.
-    
-    Args:
-        instance_row: The ListItem control representing the instance
-        index: The index of the instance
-        main_window: The main window to search for additional controls
-    
-    Returns:
-        dict: Contains 'name', 'running_state', and 'checkbox_state'
-    """
-    instance_info = {
-        'name': f'Instance_{index}',
-        'running_state': 'Unknown',
-        'checkbox_state': 'Unknown'
+def load_settings():
+    """Load settings from JSON file."""
+    settings_file = "mumu_settings.json"
+    default_settings = {
+        "batch_size": 1,
+        "cycle_interval": 60
     }
     
     try:
-        # Get all text elements within this instance row
-        text_elements = instance_row.descendants(control_type="Text")
-        
-        # Look for status text
-        status_found = False
-        for text_elem in text_elements:
-            text_content = text_elem.window_text()
-            if text_content:
-                # Check for running indicators
-                if "running" in text_content.lower():
-                    instance_info['running_state'] = 'Running'
-                    status_found = True
-                elif "not started" in text_content.lower():
-                    instance_info['running_state'] = 'Not Started'
-                    status_found = True
-                elif "stopped" in text_content.lower():
-                    instance_info['running_state'] = 'Stopped'
-                    status_found = True
-                
-                # Try to extract instance name
-                if any(keyword in text_content.upper() for keyword in ['ROM', 'MUMU', 'PLAYER', 'CLONE']):
-                    instance_info['name'] = text_content
-        
-        # Alternative method: Look for buttons within the instance row
-        if not status_found:
-            buttons = instance_row.descendants(control_type="Button")
-            for button in buttons:
-                button_rect = button.rectangle()
-                if button_rect:
-                    # Play buttons are typically on the right side of the row
-                    row_rect = instance_row.rectangle()
-                    if row_rect and button_rect.left > (row_rect.left + row_rect.width() * 0.7):
-                        # Check if button is enabled/disabled or has specific properties
-                        if button.is_enabled():
-                            # Try to determine button type by position or class
-                            button_class = button.element_info.class_name or ""
-                            automation_id = button.element_info.automation_id or ""
-                            
-                            # This is a heuristic - you might need to adjust based on actual button properties
-                            if "play" in button_class.lower() or "start" in button_class.lower():
-                                instance_info['running_state'] = 'Not Started'
-                            elif "stop" in button_class.lower() or "power" in button_class.lower():
-                                instance_info['running_state'] = 'Running'
-        
-        # Check checkbox state
-        # Look for checkbox controls within the main window that correspond to this instance
-        row_rect = instance_row.rectangle()
-        if row_rect:
-            # Calculate expected checkbox position
-            checkbox_x = row_rect.left + 36 + 15
-            checkbox_y = row_rect.top + 28
-            
-            # Try to find checkbox controls near this position
-            all_checkboxes = main_window.descendants(control_type="CheckBox")
-            for checkbox in all_checkboxes:
-                cb_rect = checkbox.rectangle()
-                if cb_rect:
-                    # Check if checkbox is in similar Y position (same row)
-                    if abs(cb_rect.top - checkbox_y) < 20:  # Within 20 pixels
-                        try:
-                            # Check if checkbox is checked
-                            if hasattr(checkbox, 'get_toggle_state'):
-                                toggle_state = checkbox.get_toggle_state()
-                                instance_info['checkbox_state'] = 'Checked' if toggle_state == 1 else 'Unchecked'
-                            else:
-                                # Alternative method using selection state
-                                try:
-                                    is_selected = checkbox.is_selected()
-                                    instance_info['checkbox_state'] = 'Checked' if is_selected else 'Unchecked'
-                                except:
-                                    # Try using window text or other properties
-                                    checkbox_text = checkbox.window_text()
-                                    if checkbox_text and "checked" in checkbox_text.lower():
-                                        instance_info['checkbox_state'] = 'Checked'
-                                    else:
-                                        instance_info['checkbox_state'] = 'Unchecked'
-                        except Exception as e:
-                            instance_info['checkbox_state'] = f'Error: {str(e)}'
-                        break
-        
-        # Fallback: Try to detect state from visual elements positioning
-        if instance_info['running_state'] == 'Unknown':
-            # Look for specific UI elements that indicate running state
-            all_elements = instance_row.descendants()
-            for elem in all_elements:
-                elem_class = elem.element_info.class_name or ""
-                elem_text = elem.window_text() or ""
-                
-                # Look for specific MuMu UI indicators
-                if "running" in elem_text.lower() or "run" in elem_class.lower():
-                    instance_info['running_state'] = 'Running'
-                    break
-                elif "start" in elem_text.lower() or "play" in elem_class.lower():
-                    instance_info['running_state'] = 'Not Started'
-                    break
+        with open(settings_file, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+            # Ensure all required keys exist
+            for key, default_value in default_settings.items():
+                if key not in settings:
+                    settings[key] = default_value
+            return settings
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default_settings
+
+def save_settings(batch_size, cycle_interval):
+    """Save settings to JSON file."""
+    settings_file = "mumu_settings.json"
+    settings = {
+        "batch_size": batch_size,
+        "cycle_interval": cycle_interval
+    }
     
+    try:
+        with open(settings_file, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+        print(f"Configurações salvas em {settings_file}")
     except Exception as e:
-        instance_info['running_state'] = f'Error: {str(e)}'
-        instance_info['checkbox_state'] = f'Error: {str(e)}'
+        print(f"Erro ao salvar configurações: {e}")
+
+def create_path_config_ui():
+    """Create a Tkinter UI for configuring the MuMu installation path."""
+    path_window = tk.Tk()
+    path_window.title("Configurar Caminho do MuMu")
+    path_window.geometry("600x200")
+    path_window.configure(bg="#F5F5F5")
+    path_window.resizable(False, False)
+
+    style = ttk.Style()
+    style.theme_use('default')
+    style.configure("TButton", font=("Arial", 10))
+    style.configure("TLabel", background="#F5F5F5", foreground="#212121", font=("Arial", 10))
+
+    last_path_file = "last_mumu_path.json"
+    prev_path = ""
+    try:
+        with open(last_path_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        prev_path = data.get("mumu_base_path", "").strip()
+        if not (prev_path and os.path.isdir(prev_path) and os.path.exists(os.path.join(prev_path, "shell", "MuMuManager.exe"))):
+            prev_path = ""
+    except Exception:
+        prev_path = ""
+
+    main_frame = tk.Frame(path_window, bg="#F5F5F5")
+    main_frame.pack(pady=20, padx=20, fill=tk.BOTH, expand=True)
+
+    path_var = tk.StringVar(value=prev_path)
+    result = {"mumu_base_path": None}
+
+    def validate_path(path):
+        if not path or not os.path.isdir(path):
+            return False
+        mumu_manager = os.path.join(path, "shell", "MuMuManager.exe")
+        return os.path.exists(mumu_manager)
+
+    def reuse_path():
+        if validate_path(prev_path):
+            result["mumu_base_path"] = prev_path
+            try:
+                with open(last_path_file, "w", encoding="utf-8") as f:
+                    json.dump({"mumu_base_path": prev_path}, f)
+                print(f"Caminho salvo em {last_path_file}")
+            except Exception as e:
+                print(f"Não foi possível salvar o caminho: {e}")
+            path_window.destroy()
+        else:
+            error_label.config(text="Caminho anterior inválido ou MuMuManager.exe não encontrado")
+
+    def confirm_path():
+        path = path_entry.get().strip('"').strip()
+        if validate_path(path):
+            result["mumu_base_path"] = path
+            try:
+                with open(last_path_file, "w", encoding="utf-8") as f:
+                    json.dump({"mumu_base_path": path}, f)
+                print(f"Caminho salvo em {last_path_file}")
+            except Exception as e:
+                print(f"Não foi possível salvar o caminho: {e}")
+            path_window.destroy()
+        else:
+            error_label.config(text="Caminho inválido ou MuMuManager.exe não encontrado")
+
+    if prev_path:
+        tk.Label(main_frame, text=f"Caminho anterior: {prev_path}", bg="#F5F5F5", fg="#212121", font=("Arial", 10)).pack(anchor="w", pady=5)
+        button_frame = tk.Frame(main_frame, bg="#F5F5F5")
+        button_frame.pack(anchor="w", pady=5)
+        ttk.Button(button_frame, text="Reutilizar", command=reuse_path).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Mudar Caminho", command=lambda: [prev_path_label.pack_forget(), button_frame.pack_forget(), new_path_frame.pack(anchor="w", pady=5)]).pack(side=tk.LEFT, padx=5)
+    else:
+        tk.Label(main_frame, text="Digite o caminho de instalação do MuMu (ex.: D:\\Program Files\\Netease\\MuMuPlayerGlobal-12.0):", bg="#F5F5F5", fg="#212121", font=("Arial", 10)).pack(anchor="w", pady=5)
+
+    prev_path_label = tk.Label(main_frame, text="Digite o caminho de instalação do MuMu (ex.: D:\\Program Files\\Netease\\MuMuPlayerGlobal-12.0):", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
+    new_path_frame = tk.Frame(main_frame, bg="#F5F5F5")
+    path_entry = tk.Entry(new_path_frame, textvariable=path_var, width=50, font=("Arial", 10))
+    path_entry.pack(side=tk.LEFT, padx=5)
+    ttk.Button(new_path_frame, text="Confirmar", command=confirm_path).pack(side=tk.LEFT, padx=5)
+    error_label = tk.Label(main_frame, text="", bg="#F5F5F5", fg="#D32F2F", font=("Arial", 10))
+    error_label.pack(anchor="w", pady=5)
+
+    if not prev_path:
+        prev_path_label.pack(anchor="w", pady=5)
+        new_path_frame.pack(anchor="w", pady=5)
+
+    def on_closing():
+        sys.exit(0)
+
+    path_window.protocol("WM_DELETE_WINDOW", on_closing)
+    path_window.mainloop()
+    return result["mumu_base_path"]
+
+def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_thread_container, total_instances):
+    """Create a Tkinter UI with a light mode design, chart, and cycle controls."""
+    root = tk.Tk()
+    root.title("Gerenciador de Instâncias MuMu")
+    root.geometry("800x600")
+    root.configure(bg="#F5F5F5")  # Light background
+
+    style = ttk.Style()
+    style.theme_use('default')
+    style.configure("TProgressbar", troughcolor="#E0E0E0", background="#2196F3")
+    style.configure("TLabel", background="#F5F5F5", foreground="#212121", font=("Arial", 10))
+    style.configure("TButton", font=("Arial", 10))
+
+    # Load saved settings
+    settings = load_settings()
+    saved_batch_size = settings.get("batch_size", 1)
+    saved_cycle_interval = settings.get("cycle_interval", 60)
+
+    top_frame = tk.Frame(root, bg="#F5F5F5")
+    top_frame.pack(pady=10, fill=tk.X, padx=10)
+
+    control_frame = tk.Frame(top_frame, bg="#F5F5F5")
+    control_frame.pack(anchor="w", pady=5)
     
-    return instance_info
+    # Batch size controls
+    tk.Label(control_frame, text="Tamanho do Lote:", bg="#F5F5F5", fg="#212121", font=("Arial", 10)).pack(side=tk.LEFT)
+    batch_size_entry = tk.Entry(control_frame, width=5, font=("Arial", 10))
+    batch_size_entry.insert(0, str(saved_batch_size))
+    batch_size_entry.pack(side=tk.LEFT, padx=5)
+    
+    # Cycle interval controls
+    tk.Label(control_frame, text="Intervalo (seg):", bg="#F5F5F5", fg="#212121", font=("Arial", 10)).pack(side=tk.LEFT, padx=(10, 0))
+    cycle_interval_entry = tk.Entry(control_frame, width=5, font=("Arial", 10))
+    cycle_interval_entry.insert(0, str(saved_cycle_interval))
+    cycle_interval_entry.pack(side=tk.LEFT, padx=5)
+    
+    start_button = ttk.Button(control_frame, text="Iniciar Ciclo")
+    start_button.pack(side=tk.LEFT, padx=5)
+    stop_button = ttk.Button(control_frame, text="Parar Ciclo", state="disabled")
+    stop_button.pack(side=tk.LEFT, padx=5)
+    error_label = tk.Label(control_frame, text="", bg="#F5F5F5", fg="#D32F2F", font=("Arial", 10))
+    error_label.pack(side=tk.LEFT, padx=5)
+
+    progress_label = tk.Label(top_frame, text="Progresso do Ciclo:", bg="#F5F5F5", fg="#212121", font=("Arial", 12))
+    progress_label.pack(anchor="w")
+    progress_bar = ttk.Progressbar(top_frame, length=400, mode='determinate')
+    progress_bar.pack(fill=tk.X, pady=5)
+
+    status_label = tk.Label(top_frame, text="Status: Inativo", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
+    status_label.pack(anchor="w")
+    current_batch_label = tk.Label(top_frame, text="Lote Atual: Nenhum", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
+    current_batch_label.pack(anchor="w")
+    last_cycle_label = tk.Label(top_frame, text="Último Ciclo: Nenhum", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
+    last_cycle_label.pack(anchor="w")
+    cycle_count_label = tk.Label(top_frame, text="Ciclos: 0 / 0", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
+    cycle_count_label.pack(anchor="w")
+    time_remaining_label = tk.Label(top_frame, text="Tempo Restante: N/A", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
+    time_remaining_label.pack(anchor="w")
+
+    bottom_frame = tk.Frame(root, bg="#F5F5F5")
+    bottom_frame.pack(pady=10, fill=tk.BOTH, expand=True, padx=10)
+
+    instance_frame = tk.Frame(bottom_frame, bg="#F5F5F5")
+    instance_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    instance_listbox = tk.Listbox(instance_frame, height=10, width=30, bg="#FFFFFF", fg="#212121", font=("Arial", 10))
+    instance_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar = tk.Scrollbar(instance_frame, orient=tk.VERTICAL, command=instance_listbox.yview)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    instance_listbox.config(yscrollcommand=scrollbar.set)
+
+    chart_frame = tk.Frame(bottom_frame, bg="#F5F5F5")
+    chart_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+    fig, ax = plt.subplots(figsize=(4, 3), facecolor="#F5F5F5")
+    ax.set_facecolor("#FFFFFF")
+    canvas = FigureCanvasTkAgg(fig, master=chart_frame)
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    times = []
+    running_counts = []
+    last_vm_info = None
+    stop_ui_update = False
+    after_id = None
+    batch_size = tk.IntVar(value=0)  # Create batch_size here
+    cycle_count = 0  # Track current session cycles
+    total_cycles_needed = 0  # Track total cycles needed to complete all instances
+
+    def calculate_total_cycles():
+        """Calculate total cycles needed based on current batch size."""
+        try:
+            batch_size_val = int(batch_size_entry.get())
+            if batch_size_val > 0 and batch_size_val <= total_instances:
+                return (total_instances + batch_size_val - 1) // batch_size_val
+        except ValueError:
+            pass
+        return 0
+
+    def update_cycle_display():
+        """Update the cycle count display."""
+        total_needed = calculate_total_cycles()
+        cycle_count_label.config(text=f"Ciclos: {cycle_count} / {total_needed}")
+
+    def validate_batch_size():
+        try:
+            size = int(batch_size_entry.get())
+            
+            if size <= 0:
+                error_label.config(text="Tamanho do lote deve ser um número positivo")
+                return False
+            if size > total_instances:
+                error_label.config(text=f"Tamanho do lote deve ser ≤ {total_instances}")
+                return False
+            error_label.config(text="")
+            # Update cycle display when batch size changes
+            update_cycle_display()
+            return size
+        except ValueError:
+            error_label.config(text="Tamanho do lote deve ser um número válido")
+            return False
+
+    def validate_cycle_interval():
+        try:
+            interval = int(cycle_interval_entry.get())
+            
+            if interval <= 0:
+                error_label.config(text="Intervalo deve ser um número positivo")
+                return False
+            if interval < 10:
+                error_label.config(text="Intervalo mínimo é 10 segundos")
+                return False
+            error_label.config(text="")
+            return interval
+        except ValueError:
+            error_label.config(text="Intervalo deve ser um número válido")
+            return False
+
+    def start_cycle():
+        global is_cycling
+        batch_size_val = validate_batch_size()
+        cycle_interval_val = validate_cycle_interval()
+        
+        if batch_size_val and cycle_interval_val:
+            # Stop all running instances first to ensure clean start
+            running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager))) if vm["status"] == "running" and not vm["is_main"]]
+            if running_vms:
+                print("Parando todas as instâncias para iniciar novo ciclo...")
+                control_instances(mumu_manager, running_vms, SelectionActions.STOP)
+                time.sleep(3)  # Wait for instances to stop
+            
+            batch_size.set(batch_size_val)
+            is_cycling = True
+            start_button.config(state="disabled")
+            stop_button.config(state="normal")
+            error_label.config(text="")
+            status_label.config(text="Status: Em Execução")
+            
+            # Reset cycle count when starting and calculate total cycles needed
+            nonlocal cycle_count, total_cycles_needed
+            cycle_count = 0
+            total_cycles_needed = calculate_total_cycles()
+            
+            # Save settings
+            save_settings(batch_size_val, cycle_interval_val)
+            
+            # Clear queue to avoid stale data
+            while not update_queue.empty():
+                update_queue.get()
+            # Always send the latest interval and batch size
+            update_queue.put({
+                "reset_index": True, 
+                "batch_size": batch_size_val,
+                "cycle_interval": cycle_interval_val,
+                "reset_cycle": True  # Signal to reset cycle state
+            })
+            print(f"Ciclo iniciado com reset completo. Intervalo: {cycle_interval_val}s")
+        else:
+            print("Falha ao iniciar ciclo: valores inválidos")
+
+    def stop_cycle():
+        global is_cycling
+        is_cycling = False
+        start_button.config(state="normal")
+        stop_button.config(state="disabled")
+        status_label.config(text="Status: Parado")
+        progress_bar['value'] = 0
+        time_remaining_label.config(text="Tempo Restante: N/A")
+        current_batch_label.config(text="Lote Atual: Nenhum")
+        last_cycle_label.config(text="Último Ciclo: Nenhum")
+        
+        # Reset cycle count
+        nonlocal cycle_count
+        cycle_count = 0
+        update_cycle_display()
+        
+        # Try to save settings if validation passes, but don't require it
+        try:
+            batch_size_val = validate_batch_size()
+            cycle_interval_val = validate_cycle_interval()
+            if batch_size_val and cycle_interval_val:
+                save_settings(batch_size_val, cycle_interval_val)
+        except:
+            pass  # Don't fail if validation doesn't pass
+        
+        # Stop all running instances
+        running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager))) if vm["status"] == "running" and not vm["is_main"]]
+        if running_vms:
+            print("Parando todas as instâncias...")
+            control_instances(mumu_manager, running_vms, SelectionActions.STOP)
+            print("Todas as instâncias paradas.")
+        
+        # Clear queue and reset state
+        while not update_queue.empty():
+            update_queue.get()
+        update_queue.put({
+            "last_routine_run": None, 
+            "last_routine_range": None,
+            "reset_cycle": True
+        })
+        print("Ciclo parado e resetado completamente.")
+
+    start_button.config(command=start_cycle)
+    stop_button.config(command=stop_cycle)
+
+    # Initialize cycle display with loaded settings
+    update_cycle_display()
+
+    # Ensure clean startup state
+    def ensure_clean_startup():
+        """Ensure no instances are running when the program starts."""
+        running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager))) if vm["status"] == "running" and not vm["is_main"]]
+        if running_vms:
+            print("Limpando instâncias de sessões anteriores...")
+            control_instances(mumu_manager, running_vms, SelectionActions.STOP)
+            time.sleep(2)
+            print("Estado limpo - pronto para iniciar.")
+
+    # Call clean startup
+    ensure_clean_startup()
+
+    def close_window():
+        """Handle window close event."""
+        global global_should_stop, is_cycling
+        nonlocal stop_ui_update, after_id
+        print("Fechando janela, encerrando programa...")
+        global_should_stop = True
+        is_cycling = False
+        stop_ui_update = True
+        if after_id:
+            root.after_cancel(after_id)
+        if management_thread_container and management_thread_container[0].is_alive():
+            management_thread_container[0].join(timeout=10.0)  # Wait for cleanup
+        root.destroy()
+        print("Janela fechada, processo encerrado.")
+        sys.exit(0)
+
+    root.protocol("WM_DELETE_WINDOW", close_window)
+
+    def update_ui():
+        nonlocal last_vm_info, stop_ui_update, after_id, cycle_count, total_cycles_needed
+        if stop_ui_update or global_should_stop:
+            return
+        try:
+            while True:
+                data = update_queue.get_nowait()
+                last_routine_run = data.get("last_routine_run")
+                last_routine_range = data.get("last_routine_range")
+                current_time = data.get("current_time")
+                status = data.get("status")
+                vm_info = data.get("vm_info", [])
+                cycle_completed = data.get("cycle_completed", False)
+                reset_cycle = data.get("reset_cycle", False)
+                
+                # Handle cycle reset
+                if reset_cycle:
+                    cycle_count = 0
+                    update_cycle_display()
+                
+                # Update cycle count if a cycle was completed
+                if cycle_completed:
+                    cycle_count += 1
+                
+                # Get current cycle interval from UI or use default
+                try:
+                    current_cycle_interval = int(cycle_interval_entry.get())
+                except ValueError:
+                    current_cycle_interval = 60
+
+                if status:
+                    status_label.config(text=f"Status: {status}")
+
+                if last_routine_run is None or not is_cycling:
+                    progress = 0
+                    time_remaining = "N/A"
+                else:
+                    elapsed = current_time - last_routine_run
+                    progress = (elapsed / current_cycle_interval) * 100
+                    time_remaining = f"{int(current_cycle_interval - elapsed)} segundos" if elapsed < current_cycle_interval else "0 segundos"
+                
+                progress_bar['value'] = min(progress, 100)
+                time_remaining_label.config(text=f"Tempo Restante: {time_remaining}")
+                
+                # Update cycle count display
+                update_cycle_display()
+                
+                if last_routine_range and is_cycling:
+                    start, end = last_routine_range
+                    if start > end:
+                        current_batch_label.config(text=f"Lote Atual: Instâncias {start} a {total_instances}, 1 a {end}")
+                    else:
+                        current_batch_label.config(text=f"Lote Atual: Instâncias {start} a {end}")
+                else:
+                    current_batch_label.config(text="Lote Atual: Nenhum")
+                
+                if last_routine_run and is_cycling:
+                    last_cycle_label.config(text=f"Último Ciclo: {datetime.fromtimestamp(last_routine_run, tz=timezone(timedelta(hours=-3))).strftime('%H:%M:%S')}")
+                
+                instance_listbox.delete(0, tk.END)
+                if vm_info:  # Check if vm_info is not empty
+                    for vm in vm_info:
+                        status_pt = "Em Execução" if vm["status"] == "running" else "Parado"
+                        instance_listbox.insert(tk.END, f"VM {vm['index']}: {vm['name']} ({status_pt})")
+                else:
+                    instance_listbox.insert(tk.END, "Nenhuma VM disponível")
+
+                if vm_info and vm_info != last_vm_info:
+                    running_count = sum(1 for vm in vm_info if vm["status"] == "running")
+                    times.append(current_time)
+                    running_counts.append(running_count)
+                    ax.clear()
+                    ax.plot(times, running_counts, label="VMs em Execução", color="#2196F3")
+                    ax.set_xlabel("Tempo (s)", color="#212121")
+                    ax.set_ylabel("Número de VMs em Execução", color="#212121")
+                    ax.tick_params(colors="#212121")
+                    ax.grid(color=(0, 0, 0, 0.1))
+                    ax.set_facecolor("#FFFFFF")
+                    fig.patch.set_facecolor("#F5F5F5")
+                    ax.legend(facecolor="#FFFFFF", edgecolor="#212121", labelcolor="#212121")
+                    canvas.draw()
+                    last_vm_info = vm_info
+
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"Erro na atualização da UI: {e}")
+        if not stop_ui_update and not global_should_stop:
+            after_id = root.after(50, update_ui)
+
+    return root, update_ui, status_label, batch_size, cycle_interval_entry
+
+def main():
+    global global_should_stop, total_instances
+    
+    # Load saved settings
+    settings = load_settings()
+    cycle_interval = settings.get("cycle_interval", 60)
+    
+    update_queue = queue.Queue()
+
+    # Get path configuration via UI
+    mumu_base_path = create_path_config_ui()
+    if not mumu_base_path:
+        print("Nenhum caminho fornecido. Encerrando.")
+        sys.exit(1)
+
+    mumu_manager = os.path.join(mumu_base_path, "shell", "MuMuManager.exe")
+    vm_base_name = "ROM_"
+    print("Verificando nomes das VMs...")
+    vm_info = get_vm_info(mumu_base_path)
+    active_vm_info = [vm for vm in vm_info if not vm["is_main"]]
+    active_vm_indices = sorted([int(vm["index"]) for vm in active_vm_info])
+
+    print("Parando todas as VMs não principais antes de renomear...")
+    running_vm_indices = [int(vm["index"]) for vm in active_vm_info if vm["status"] == "running"]
+    if running_vm_indices:
+        control_instances(mumu_manager, running_vm_indices, SelectionActions.STOP)
+        time.sleep(5)
+    else:
+        print("Nenhuma VM não principal em execução encontrada.")
+
+    vm_names = padronize_vm_names(vm_base_name, mumu_base_path)
+    print(f"Encontradas {len(vm_names)} VMs: {vm_names}")
+    
+    if not active_vm_indices:
+        print("Erro: Nenhuma VM não principal encontrada. Crie VMs no Gerenciador de Instâncias Múltiplas do MuMu.")
+        sys.exit(1)
+
+    time.sleep(5)
+
+    total_instances = len(active_vm_indices)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    management_thread_container = []
+    root, update_ui, status_label, batch_size, cycle_interval_entry = create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_thread_container, total_instances)
+    
+    management_thread = threading.Thread(target=run_management, args=(update_queue, mumu_manager, active_vm_indices, cycle_interval, batch_size))
+    management_thread_container.append(management_thread)
+
+    management_thread.start()
+    update_ui()
+
+    root.mainloop()
+    global_should_stop = True
+    if management_thread_container and management_thread_container[0].is_alive():
+        management_thread_container[0].join(timeout=10.0)
+    print("Programa encerrado.")
+    sys.exit(0)
+
+def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval, batch_size_var=None):
+    global global_should_stop, is_cycling
+    last_routine_run = None
+    last_routine_range = None
+    current_cycle_interval = cycle_interval  # Track current cycle interval
+    vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
+    last_vm_info_update = 0
+    current_index = 0  # Track position in active_vm_indices
+
+    print("Iniciando gerenciamento de instâncias...")
+    while not global_should_stop:
+        try:
+            current_time = time.time()
+            if current_time - last_vm_info_update >= 1:
+                vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
+                last_vm_info_update = current_time
+
+            # Process queue for control messages
+            while not update_queue.empty():
+                data = update_queue.get_nowait()
+                if data.get("reset_index"):
+                    current_index = 0
+                if "last_routine_run" in data and data["last_routine_run"] is None:
+                    last_routine_run = None
+                    last_routine_range = None
+                # Update cycle interval if provided
+                if "cycle_interval" in data:
+                    current_cycle_interval = data["cycle_interval"]
+                    print(f"Cycle interval updated to: {current_cycle_interval} seconds")
+                # Handle complete reset
+                if data.get("reset_cycle"):
+                    last_routine_run = None
+                    last_routine_range = None
+                    current_index = 0
+                    print("Cycle state reset complete")
+
+            update_queue.put({
+                "last_routine_run": last_routine_run,
+                "last_routine_range": last_routine_range,
+                "current_time": current_time,
+                "status": "Em Execução" if is_cycling else "Parado",
+                "vm_info": vm_info
+            })
+
+            if is_cycling and (last_routine_run is None or (current_time - last_routine_run) >= current_cycle_interval):
+                print(f"Cycle time reached. Current time: {current_time}, Last run: {last_routine_run}, Interval: {current_cycle_interval}")
+                
+                # Stop all running instances before starting new batch
+                running_vms = [int(vm["index"]) for vm in vm_info if vm["status"] == "running" and not vm["is_main"]]
+                if running_vms:
+                    print(f"Stopping running VMs: {running_vms}")
+                    update_queue.put({
+                        "last_routine_run": last_routine_run,
+                        "last_routine_range": last_routine_range,
+                        "current_time": current_time,
+                        "status": f"Parando todas as VMs em execução: {running_vms}",
+                        "vm_info": vm_info
+                    })
+                    control_instances(mumu_manager, running_vms, SelectionActions.STOP)
+                    time.sleep(5)
+                else:
+                    print("No running VMs to stop")
+
+                try:
+                    batch_size = batch_size_var.get() if batch_size_var else 1
+                except Exception:
+                    batch_size = 1
+                print(f"Batch size from UI: {batch_size}")
+                
+                if not isinstance(batch_size, int) or batch_size <= 0:
+                    batch_size = 1  # Fallback to avoid zero/negative batch size
+                vm_indices = []
+                start_point = current_index
+                for i in range(batch_size):
+                    idx = active_vm_indices[(current_index + i) % len(active_vm_indices)]
+                    vm_indices.append(idx)
+                current_index = (current_index + batch_size) % len(active_vm_indices)
+
+                if vm_indices:
+                    min_idx = min([active_vm_indices.index(idx) for idx in vm_indices]) + 1
+                    max_idx = max([active_vm_indices.index(idx) for idx in vm_indices]) + 1
+                    end_point = max_idx if max_idx >= min_idx else max_idx + len(active_vm_indices)
+                else:
+                    min_idx = start_point + 1
+                    end_point = start_point + 1
+
+                print(f"Starting new batch: VMs {vm_indices} (batch {min_idx}-{end_point})")
+                update_queue.put({
+                    "last_routine_run": last_routine_run,
+                    "last_routine_range": last_routine_range,
+                    "current_time": current_time,
+                    "status": f"Iniciando lote {min_idx}-{end_point}",
+                    "batch_size": batch_size,
+                    "vm_info": vm_info
+                })
+                print(f"Starting VMs: {vm_indices}")  # Debug print
+                control_instances(mumu_manager, vm_indices, SelectionActions.START)
+                last_routine_run = current_time
+                last_routine_range = (min_idx, end_point)
+                
+                # Send cycle completion signal
+                update_queue.put({
+                    "cycle_completed": True,
+                    "current_time": current_time
+                })
+                print(f"Cycle completed. Next cycle in {current_cycle_interval} seconds")
+
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"Erro no loop principal: {e}")
+            update_queue.put({
+                "last_routine_run": last_routine_run,
+                "last_routine_range": last_routine_range,
+                "current_time": current_time,
+                "status": f"Erro - {str(e)}",
+                "vm_info": vm_info
+            })
+            time.sleep(2)
+
+    print("Limpando...")
+    update_queue.put({
+        "last_routine_run": last_routine_run,
+        "last_routine_range": last_routine_range,
+        "current_time": time.time(),
+        "status": "Desligando",
+        "vm_info": vm_info
+    })
+    try:
+        running_vms = [int(vm["index"]) for vm in vm_info if vm["status"] == "running" and not vm["is_main"]]
+        if running_vms:
+            control_instances(mumu_manager, running_vms, SelectionActions.STOP)
+            print("Todas as instâncias paradas.")
+    except Exception as e:
+        print(f"Erro na limpeza: {e}")
 
 if __name__ == "__main__":
     main()
