@@ -285,6 +285,8 @@ def control_instances(mumu_manager, vm_indices, action):
             )
             print(f"Executado com sucesso {action} para VM {idx}")
             successful_indices.append(idx)
+            # wait 1 second
+            time.sleep(1)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             print(f"Erro ao executar {action} para VM {idx}: {e}")
             failed_indices.append(idx)
@@ -544,6 +546,7 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
     batch_size = tk.IntVar(value=0)  # Create batch_size here
     cycle_count = 0  # Track current session cycles
     total_cycles_needed = 0  # Track total cycles needed to complete all instances
+    is_retry_attempt = False # New state variable for retry logic
 
     def calculate_total_cycles():
         """Calculate total cycles needed based on current batch size."""
@@ -985,6 +988,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
     vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
     last_vm_info_update = 0
     current_index = 0  # Track position in active_vm_indices
+    is_retry_attempt = False # New state variable for retry logic
 
     print("Iniciando gerenciamento de instâncias...")
     while not global_should_stop:
@@ -1077,6 +1081,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                     print("Batch start confirmed. Resetting cycle timer.")
                     last_routine_run = time.time() # Use current time after verification
                     current_index = (current_index + batch_size) % len(active_vm_indices)
+                    is_retry_attempt = False # Reset retry flag on success
                     
                     min_idx = min([active_vm_indices.index(idx) for idx in vm_indices_to_start]) + 1
                     max_idx = max([active_vm_indices.index(idx) for idx in vm_indices_to_start]) + 1
@@ -1088,8 +1093,13 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                     })
                     print(f"Cycle completed. Next cycle in {current_cycle_interval} seconds")
                 else:
-                    print("CRITICAL: No VMs in the batch started successfully after 90s. Will retry same batch.")
-                    # Do not update last_routine_run or current_index, so the same batch is retried
+                    if is_retry_attempt:
+                        # The retry attempt also failed. Give up and move to the next batch.
+                        print("CRITICAL: Retry failed. Moving to the next batch for the next cycle.")
+                        last_routine_run = time.time() # Reset timer to wait for full interval
+                        current_index = (current_index + batch_size) % len(active_vm_indices)
+                        is_retry_attempt = False # Reset for the next batch
+                    
                     last_routine_range = None # Clear range as it's not running
             
             # Adaptive sleep: shorter when cycling, longer when idle
