@@ -190,12 +190,23 @@ def get_vm_info(mumu_base_path):
             )
             vm_data = json.loads(result.stdout)
             if vm_data.get("error_code", -1) == 0:
-                status = "running" if vm_data.get("is_android_started", False) else "stopped"
+                is_android_started = vm_data.get("is_android_started", False)
+                is_process_started = vm_data.get("is_process_started", False)
+                launch_err_code = vm_data.get("launch_err_code", 0)
+                launch_err_msg = vm_data.get("launch_err_msg", "")
+                has_error = launch_err_code != 0 or bool(launch_err_msg)
+
+                # Status reflects the process state, which is what 'stop' commands target.
+                process_status = "running" if is_process_started else "stopped"
+                
                 return {
                     "index": vm_data["index"],
                     "name": vm_data["name"],
-                    "status": status,
-                    "is_main": vm_data.get("is_main", False)
+                    "status": process_status,
+                    "is_main": vm_data.get("is_main", False),
+                    "is_android_started": is_android_started,
+                    "has_error": has_error,
+                    "error_message": launch_err_msg,
                 }
             return None
         except (subprocess.CalledProcessError, json.JSONDecodeError, subprocess.TimeoutExpired):
@@ -883,7 +894,15 @@ Handles Máximos: {peak_stats['handle_peak']}
                 instance_listbox.delete(0, tk.END)
                 if vm_info:  # Check if vm_info is not empty
                     for vm in vm_info:
-                        status_pt = "Em Execução" if vm["status"] == "running" else "Parado"
+                        status_pt = "Parado"  # Default
+                        if vm.get('is_android_started'):
+                            status_pt = "Em Execução"
+                        elif vm.get('has_error'):
+                            error_msg = vm.get('error_message', 'Erro')
+                            status_pt = f"Erro ({error_msg})"
+                        elif vm.get('status') == 'running':
+                            status_pt = "Iniciando"
+                        
                         instance_listbox.insert(tk.END, f"VM {vm['index']}: {vm['name']} ({status_pt})")
                 else:
                     instance_listbox.insert(tk.END, "Nenhuma VM disponível")
@@ -1066,12 +1085,25 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                 
                 while time.time() - start_verification_time < 90: # 90-second verification window
                     vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
-                    running_in_batch = [int(vm['index']) for vm in vm_info if vm['status'] == 'running' and int(vm['index']) in vm_indices_to_start]
                     
+                    # Check for successfully started VMs
+                    running_in_batch = [
+                        int(vm['index']) for vm in vm_info 
+                        if vm.get('is_android_started', False) and int(vm['index']) in vm_indices_to_start
+                    ]
                     if len(running_in_batch) > 0:
                         print(f"Successfully started VMs: {running_in_batch}. Batch confirmed.")
                         batch_started_successfully = True
-                        break
+                        break # Exit verification loop on success
+
+                    # Check if all VMs in the batch have errored out to fail fast
+                    errored_vms = [
+                        vm for vm in vm_info
+                        if int(vm['index']) in vm_indices_to_start and vm.get('has_error')
+                    ]
+                    if len(errored_vms) == len(vm_indices_to_start):
+                        print("CRITICAL: All VMs in the batch have reported a startup error. Failing fast.")
+                        break # Exit verification loop on definitive failure
                     
                     print(f"Waiting for VMs to start... ({int(time.time() - start_verification_time)}s)")
                     time.sleep(5)
@@ -1093,12 +1125,27 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                     })
                     print(f"Cycle completed. Next cycle in {current_cycle_interval} seconds")
                 else:
+                    # The batch failed to start. As a safety measure, ensure all non-main VMs are stopped.
+                    print("Ensuring all non-main VMs are stopped after a batch start failure.")
+                    all_vms_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
+                    vms_to_stop = [int(vm["index"]) for vm in all_vms_info if vm["status"] == "running" and not vm["is_main"]]
+                    if vms_to_stop:
+                        print(f"Stopping lingering VMs: {vms_to_stop}")
+                        control_instances(mumu_manager, vms_to_stop, SelectionActions.STOP)
+
                     if is_retry_attempt:
                         # The retry attempt also failed. Give up and move to the next batch.
                         print("CRITICAL: Retry failed. Moving to the next batch for the next cycle.")
                         last_routine_run = time.time() # Reset timer to wait for full interval
                         current_index = (current_index + batch_size) % len(active_vm_indices)
                         is_retry_attempt = False # Reset for the next batch
+                        print(f"State after failed retry: last_routine_run={last_routine_run}, is_retry_attempt={is_retry_attempt}, next_index will be {current_index}")
+                    else:
+                        # First failure. Set flag to retry once.
+                        print("CRITICAL: No VMs in the batch started or all errored. Will retry same batch once.")
+                        is_retry_attempt = True
+                        # By not updating last_routine_run, the next loop will trigger an immediate retry.
+                        print(f"State after first failure: last_routine_run={last_routine_run}, is_retry_attempt={is_retry_attempt}")
                     
                     last_routine_range = None # Clear range as it's not running
             
