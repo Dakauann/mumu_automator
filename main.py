@@ -262,24 +262,34 @@ def padronize_vm_names(vm_name_prefix, mumu_base_path):
     return sorted(vm_names)
 
 def control_instances(mumu_manager, vm_indices, action):
-    """Control VM instances one at a time using MuMuManager."""
+    """
+    Control VM instances one at a time using MuMuManager.
+    Returns a tuple of (successful_indices, failed_indices).
+    """
     if not vm_indices:
         print("Nenhum índice de VM fornecido para controle.")
-        return False
-    success = True
+        return [], []
+    
+    successful_indices = []
+    failed_indices = []
+    
     for idx in vm_indices:
         try:
+            # Add a timeout to prevent hanging
             subprocess.run(
                 [mumu_manager, "control", action, "-v", str(idx)],
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                timeout=30
             )
             print(f"Executado com sucesso {action} para VM {idx}")
-        except subprocess.CalledProcessError as e:
+            successful_indices.append(idx)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             print(f"Erro ao executar {action} para VM {idx}: {e}")
-            success = False
-    return success
+            failed_indices.append(idx)
+            
+    return successful_indices, failed_indices
 
 def load_settings():
     """Load settings from JSON file."""
@@ -1019,66 +1029,69 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
             if is_cycling and (last_routine_run is None or (current_time - last_routine_run) >= current_cycle_interval):
                 print(f"Cycle time reached. Current time: {current_time}, Last run: {last_routine_run}, Interval: {current_cycle_interval}")
                 
-                # Stop all running instances before starting new batch
-                running_vms = [int(vm["index"]) for vm in vm_info if vm["status"] == "running" and not vm["is_main"]]
+                # 1. Stop all currently running instances
+                all_vms_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
+                running_vms = [int(vm["index"]) for vm in all_vms_info if vm["status"] == "running" and not vm["is_main"]]
                 if running_vms:
                     print(f"Stopping running VMs: {running_vms}")
-                    update_queue.put({
-                        "last_routine_run": last_routine_run,
-                        "last_routine_range": last_routine_range,
-                        "current_time": current_time,
-                        "status": f"Parando todas as VMs em execução: {running_vms}",
-                        "vm_info": vm_info
-                    })
                     control_instances(mumu_manager, running_vms, SelectionActions.STOP)
-                    time.sleep(5)
-                else:
-                    print("No running VMs to stop")
+                    time.sleep(5) # Give time for VMs to shut down
 
+                # 2. Determine the next batch to start
                 try:
                     batch_size = batch_size_var.get() if batch_size_var else 1
                 except Exception:
                     batch_size = 1
-                print(f"Batch size from UI: {batch_size}")
                 
                 if not isinstance(batch_size, int) or batch_size <= 0:
-                    batch_size = 1  # Fallback to avoid zero/negative batch size
-                vm_indices = []
-                start_point = current_index
+                    batch_size = 1
+                
+                vm_indices_to_start = []
                 for i in range(batch_size):
                     idx = active_vm_indices[(current_index + i) % len(active_vm_indices)]
-                    vm_indices.append(idx)
-                current_index = (current_index + batch_size) % len(active_vm_indices)
+                    vm_indices_to_start.append(idx)
 
-                if vm_indices:
-                    min_idx = min([active_vm_indices.index(idx) for idx in vm_indices]) + 1
-                    max_idx = max([active_vm_indices.index(idx) for idx in vm_indices]) + 1
-                    end_point = max_idx if max_idx >= min_idx else max_idx + len(active_vm_indices)
-                else:
-                    min_idx = start_point + 1
-                    end_point = start_point + 1
-
-                print(f"Starting new batch: VMs {vm_indices} (batch {min_idx}-{end_point})")
-                update_queue.put({
-                    "last_routine_run": last_routine_run,
-                    "last_routine_range": last_routine_range,
-                    "current_time": current_time,
-                    "status": f"Iniciando lote {min_idx}-{end_point}",
-                    "batch_size": batch_size,
-                    "vm_info": vm_info
-                })
-                print(f"Starting VMs: {vm_indices}")  # Debug print
-                control_instances(mumu_manager, vm_indices, SelectionActions.START)
-                last_routine_run = current_time
-                last_routine_range = (min_idx, end_point)
+                # 3. Start the new batch
+                print(f"Attempting to start new batch: VMs {vm_indices_to_start}")
+                control_instances(mumu_manager, vm_indices_to_start, SelectionActions.START)
                 
-                # Send cycle completion signal
-                update_queue.put({
-                    "cycle_completed": True,
-                    "current_time": current_time
-                })
-                print(f"Cycle completed. Next cycle in {current_cycle_interval} seconds")
+                # 4. Verify the new batch started correctly
+                print("Verifying startup status...")
+                start_verification_time = time.time()
+                batch_started_successfully = False
+                
+                while time.time() - start_verification_time < 90: # 90-second verification window
+                    vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
+                    running_in_batch = [int(vm['index']) for vm in vm_info if vm['status'] == 'running' and int(vm['index']) in vm_indices_to_start]
+                    
+                    if len(running_in_batch) > 0:
+                        print(f"Successfully started VMs: {running_in_batch}. Batch confirmed.")
+                        batch_started_successfully = True
+                        break
+                    
+                    print(f"Waiting for VMs to start... ({int(time.time() - start_verification_time)}s)")
+                    time.sleep(5)
 
+                # 5. Update state only if batch start was successful
+                if batch_started_successfully:
+                    print("Batch start confirmed. Resetting cycle timer.")
+                    last_routine_run = time.time() # Use current time after verification
+                    current_index = (current_index + batch_size) % len(active_vm_indices)
+                    
+                    min_idx = min([active_vm_indices.index(idx) for idx in vm_indices_to_start]) + 1
+                    max_idx = max([active_vm_indices.index(idx) for idx in vm_indices_to_start]) + 1
+                    last_routine_range = (min_idx, max_idx)
+                    
+                    update_queue.put({
+                        "cycle_completed": True,
+                        "current_time": last_routine_run
+                    })
+                    print(f"Cycle completed. Next cycle in {current_cycle_interval} seconds")
+                else:
+                    print("CRITICAL: No VMs in the batch started successfully after 90s. Will retry same batch.")
+                    # Do not update last_routine_run or current_index, so the same batch is retried
+                    last_routine_range = None # Clear range as it's not running
+            
             # Adaptive sleep: shorter when cycling, longer when idle
             sleep_time = 0.5 if is_cycling else 1.0
             time.sleep(sleep_time)
