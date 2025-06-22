@@ -14,6 +14,150 @@ from datetime import datetime, timezone, timedelta
 import queue
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import psutil
+import gc
+
+class ResourceProfiler:
+    """Track and display resource usage metrics."""
+    
+    def __init__(self):
+        self.process = psutil.Process()
+        self.start_time = time.time()
+        self.metrics = {
+            'cpu_percent': [],
+            'memory_mb': [],
+            'thread_count': [],
+            'handle_count': [],
+            'io_counters': [],
+            'timestamps': []
+        }
+        self.profiling_active = False
+        self.profile_thread = None
+        
+    def start_profiling(self):
+        """Start resource profiling in a separate thread."""
+        if not self.profiling_active:
+            self.profiling_active = True
+            self.profile_thread = threading.Thread(target=self._profile_loop, daemon=True)
+            self.profile_thread.start()
+            print("Resource profiling started")
+    
+    def stop_profiling(self):
+        """Stop resource profiling."""
+        self.profiling_active = False
+        if self.profile_thread:
+            self.profile_thread.join(timeout=1)
+        print("Resource profiling stopped")
+    
+    def _profile_loop(self):
+        """Main profiling loop."""
+        while self.profiling_active:
+            try:
+                # Get current metrics
+                cpu_percent = self.process.cpu_percent()
+                memory_info = self.process.memory_info()
+                memory_mb = memory_info.rss / 1024 / 1024  # Convert to MB
+                thread_count = self.process.num_threads()
+                handle_count = self.process.num_handles()
+                
+                # Get IO counters if available
+                try:
+                    io_counters = self.process.io_counters()
+                    io_read_mb = io_counters.read_bytes / 1024 / 1024
+                    io_write_mb = io_counters.write_bytes / 1024 / 1024
+                except:
+                    io_read_mb = 0
+                    io_write_mb = 0
+                
+                # Store metrics
+                current_time = time.time()
+                self.metrics['cpu_percent'].append(cpu_percent)
+                self.metrics['memory_mb'].append(memory_mb)
+                self.metrics['thread_count'].append(thread_count)
+                self.metrics['handle_count'].append(handle_count)
+                self.metrics['io_counters'].append((io_read_mb, io_write_mb))
+                self.metrics['timestamps'].append(current_time)
+                
+                # Keep only last 1000 data points to prevent memory bloat
+                max_points = 1000
+                if len(self.metrics['timestamps']) > max_points:
+                    for key in self.metrics:
+                        self.metrics[key] = self.metrics[key][-max_points:]
+                
+                time.sleep(1)  # Sample every second
+                
+            except Exception as e:
+                print(f"Profiling error: {e}")
+                time.sleep(1)
+    
+    def get_current_stats(self):
+        """Get current resource statistics."""
+        if not self.metrics['timestamps']:
+            return None
+            
+        cpu_avg = sum(self.metrics['cpu_percent'][-10:]) / min(10, len(self.metrics['cpu_percent']))
+        memory_current = self.metrics['memory_mb'][-1] if self.metrics['memory_mb'] else 0
+        memory_avg = sum(self.metrics['memory_mb'][-10:]) / min(10, len(self.metrics['memory_mb']))
+        thread_current = self.metrics['thread_count'][-1] if self.metrics['thread_count'] else 0
+        handle_current = self.metrics['handle_count'][-1] if self.metrics['handle_count'] else 0
+        
+        # Calculate IO rates
+        if len(self.metrics['io_counters']) >= 2:
+            recent_io = self.metrics['io_counters'][-10:]
+            io_read_total = sum(read for read, write in recent_io)
+            io_write_total = sum(write for read, write in recent_io)
+        else:
+            io_read_total = 0
+            io_write_total = 0
+        
+        uptime = time.time() - self.start_time
+        
+        return {
+            'cpu_avg': cpu_avg,
+            'memory_current': memory_current,
+            'memory_avg': memory_avg,
+            'thread_count': thread_current,
+            'handle_count': handle_current,
+            'io_read_mb': io_read_total,
+            'io_write_mb': io_write_total,
+            'uptime': uptime,
+            'data_points': len(self.metrics['timestamps'])
+        }
+    
+    def get_peak_stats(self):
+        """Get peak resource usage."""
+        if not self.metrics['timestamps']:
+            return None
+            
+        return {
+            'cpu_peak': max(self.metrics['cpu_percent']),
+            'memory_peak': max(self.metrics['memory_mb']),
+            'thread_peak': max(self.metrics['thread_count']),
+            'handle_peak': max(self.metrics['handle_count'])
+        }
+    
+    def export_profile_data(self, filename="resource_profile.json"):
+        """Export profiling data to JSON file."""
+        try:
+            export_data = {
+                'start_time': self.start_time,
+                'end_time': time.time(),
+                'metrics': self.metrics,
+                'peak_stats': self.get_peak_stats(),
+                'current_stats': self.get_current_stats()
+            }
+            
+            with open(filename, 'w') as f:
+                json.dump(export_data, f, indent=2, default=str)
+            
+            print(f"Profile data exported to {filename}")
+            return True
+        except Exception as e:
+            print(f"Failed to export profile data: {e}")
+            return False
+
+# Global profiler instance
+resource_profiler = ResourceProfiler()
 
 class SelectionActions:
     START = "launch"
@@ -41,7 +185,8 @@ def get_vm_info(mumu_base_path):
                 [mumu_manager, "info", "-v", str(index)],
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                timeout=2  # Add timeout to prevent hanging
             )
             vm_data = json.loads(result.stdout)
             if vm_data.get("error_code", -1) == 0:
@@ -53,10 +198,12 @@ def get_vm_info(mumu_base_path):
                     "is_main": vm_data.get("is_main", False)
                 }
             return None
-        except (subprocess.CalledProcessError, json.JSONDecodeError):
+        except (subprocess.CalledProcessError, json.JSONDecodeError, subprocess.TimeoutExpired):
             return None
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # Use fewer workers when not cycling to reduce resource usage
+    max_workers = 5 if not is_cycling else 10
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_index = {executor.submit(query_vm, i): i for i in indices}
         for future in as_completed(future_to_index):
             result = future.result()
@@ -64,7 +211,9 @@ def get_vm_info(mumu_base_path):
                 vm_info.append(result)
 
     vm_info.sort(key=lambda x: x['index'])  # Sort by index for consistent order
-    print(f"Tempo decorrido: {time.time() - start_time} segundos")
+    elapsed_time = time.time() - start_time
+    if elapsed_time > 1.0:  # Only print if it takes more than 1 second
+        print(f"Tempo decorrido: {elapsed_time:.2f} segundos")
     return vm_info if vm_info else []
 
 def padronize_vm_names(vm_name_prefix, mumu_base_path):
@@ -316,6 +465,49 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
     time_remaining_label = tk.Label(top_frame, text="Tempo Restante: N/A", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
     time_remaining_label.pack(anchor="w")
 
+    # Profiling section
+    profiling_frame = tk.Frame(top_frame, bg="#F5F5F5")
+    profiling_frame.pack(anchor="w", pady=(10, 0))
+    
+    profiling_header = tk.Label(profiling_frame, text="📊 Monitoramento de Recursos", bg="#F5F5F5", fg="#212121", font=("Arial", 12, "bold"))
+    profiling_header.pack(anchor="w")
+    
+    # Resource metrics display
+    metrics_frame = tk.Frame(profiling_frame, bg="#F5F5F5")
+    metrics_frame.pack(anchor="w", pady=5)
+    
+    # CPU and Memory
+    cpu_label = tk.Label(metrics_frame, text="CPU: 0.0%", bg="#F5F5F5", fg="#212121", font=("Arial", 9))
+    cpu_label.pack(side=tk.LEFT, padx=(0, 10))
+    
+    memory_label = tk.Label(metrics_frame, text="RAM: 0.0 MB", bg="#F5F5F5", fg="#212121", font=("Arial", 9))
+    memory_label.pack(side=tk.LEFT, padx=(0, 10))
+    
+    thread_label = tk.Label(metrics_frame, text="Threads: 0", bg="#F5F5F5", fg="#212121", font=("Arial", 9))
+    thread_label.pack(side=tk.LEFT, padx=(0, 10))
+    
+    handle_label = tk.Label(metrics_frame, text="Handles: 0", bg="#F5F5F5", fg="#212121", font=("Arial", 9))
+    handle_label.pack(side=tk.LEFT, padx=(0, 10))
+    
+    uptime_label = tk.Label(metrics_frame, text="Uptime: 0s", bg="#F5F5F5", fg="#212121", font=("Arial", 9))
+    uptime_label.pack(side=tk.LEFT, padx=(0, 10))
+    
+    # Profiling controls
+    profiling_controls = tk.Frame(profiling_frame, bg="#F5F5F5")
+    profiling_controls.pack(anchor="w", pady=5)
+    
+    start_profiling_btn = ttk.Button(profiling_controls, text="Iniciar Profiling")
+    start_profiling_btn.pack(side=tk.LEFT, padx=(0, 5))
+    
+    stop_profiling_btn = ttk.Button(profiling_controls, text="Parar Profiling", state="disabled")
+    stop_profiling_btn.pack(side=tk.LEFT, padx=(0, 5))
+    
+    export_profile_btn = ttk.Button(profiling_controls, text="Exportar Dados")
+    export_profile_btn.pack(side=tk.LEFT, padx=(0, 5))
+    
+    clear_profile_btn = ttk.Button(profiling_controls, text="Limpar Dados")
+    clear_profile_btn.pack(side=tk.LEFT, padx=(0, 5))
+
     bottom_frame = tk.Frame(root, bg="#F5F5F5")
     bottom_frame.pack(pady=10, fill=tk.BOTH, expand=True, padx=10)
 
@@ -482,6 +674,72 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
     # Initialize cycle display with loaded settings
     update_cycle_display()
 
+    # Profiling control functions
+    def start_profiling():
+        global resource_profiler
+        resource_profiler.start_profiling()
+        start_profiling_btn.config(state="disabled")
+        stop_profiling_btn.config(state="normal")
+        print("Resource profiling iniciado")
+
+    def stop_profiling():
+        global resource_profiler
+        resource_profiler.stop_profiling()
+        start_profiling_btn.config(state="normal")
+        stop_profiling_btn.config(state="disabled")
+        print("Resource profiling parado")
+
+    def export_profile():
+        global resource_profiler
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"mumu_profile_{timestamp}.json"
+        if resource_profiler.export_profile_data(filename):
+            print(f"Perfil exportado: {filename}")
+        else:
+            print("Erro ao exportar perfil")
+
+    def clear_profile():
+        global resource_profiler
+        resource_profiler = ResourceProfiler()
+        print("Dados de perfil limpos")
+
+    def show_peak_stats():
+        """Display peak resource usage statistics."""
+        global resource_profiler
+        peak_stats = resource_profiler.get_peak_stats()
+        if peak_stats:
+            stats_window = tk.Toplevel(root)
+            stats_window.title("Estatísticas de Pico")
+            stats_window.geometry("400x300")
+            stats_window.configure(bg="#F5F5F5")
+            
+            tk.Label(stats_window, text="📈 Estatísticas de Pico de Recursos", 
+                    bg="#F5F5F5", fg="#212121", font=("Arial", 14, "bold")).pack(pady=10)
+            
+            stats_text = f"""
+CPU Máximo: {peak_stats['cpu_peak']:.1f}%
+Memória Máxima: {peak_stats['memory_peak']:.1f} MB
+Threads Máximos: {peak_stats['thread_peak']}
+Handles Máximos: {peak_stats['handle_peak']}
+            """
+            
+            tk.Label(stats_window, text=stats_text, 
+                    bg="#F5F5F5", fg="#212121", font=("Arial", 10), justify=tk.LEFT).pack(pady=10)
+            
+            ttk.Button(stats_window, text="Fechar", command=stats_window.destroy).pack(pady=10)
+        else:
+            print("Nenhum dado de pico disponível")
+
+    # Configure profiling buttons
+    start_profiling_btn.config(command=start_profiling)
+    stop_profiling_btn.config(command=stop_profiling)
+    export_profile_btn.config(command=export_profile)
+    clear_profile_btn.config(command=clear_profile)
+    
+    # Add peak stats button
+    peak_stats_btn = ttk.Button(profiling_controls, text="Ver Picos", command=show_peak_stats)
+    peak_stats_btn.pack(side=tk.LEFT, padx=(0, 5))
+
     # Ensure clean startup state
     def ensure_clean_startup():
         """Ensure no instances are running when the program starts."""
@@ -496,20 +754,41 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
     ensure_clean_startup()
 
     def close_window():
-        """Handle window close event."""
-        global global_should_stop, is_cycling
-        nonlocal stop_ui_update, after_id
-        print("Fechando janela, encerrando programa...")
-        global_should_stop = True
-        is_cycling = False
-        stop_ui_update = True
-        if after_id:
-            root.after_cancel(after_id)
-        if management_thread_container and management_thread_container[0].is_alive():
-            management_thread_container[0].join(timeout=10.0)  # Wait for cleanup
-        root.destroy()
-        print("Janela fechada, processo encerrado.")
-        sys.exit(0)
+        """Handle window close event with a confirmation dialog."""
+        from tkinter import messagebox
+
+        title = "Aviso: Ação Crítica"
+        message = (
+            "Fechar esta janela irá interromper e reiniciar todo o ciclo de automação.\n\n"
+            "Esta é uma ação crítica que não deve ser executada durante a operação normal.\n\n"
+            "Tem certeza que deseja continuar e encerrar o programa?"
+        )
+
+        if messagebox.askyesno(title, message, icon='warning'):
+            global global_should_stop, is_cycling, resource_profiler
+            nonlocal stop_ui_update, after_id
+            print("Confirmado. Fechando janela e encerrando programa...")
+
+            # Stop profiling and export final data
+            if resource_profiler.profiling_active:
+                print("Parando profiling e exportando dados finais...")
+                resource_profiler.stop_profiling()
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                final_filename = f"mumu_profile_final_{timestamp}.json"
+                resource_profiler.export_profile_data(final_filename)
+            
+            global_should_stop = True
+            is_cycling = False
+            stop_ui_update = True
+            if after_id:
+                root.after_cancel(after_id)
+            if management_thread_container and management_thread_container[0].is_alive():
+                management_thread_container[0].join(timeout=10.0)  # Wait for cleanup
+            root.destroy()
+            print("Janela fechada, processo encerrado.")
+            sys.exit(0)
+        else:
+            print("Encerramento da aplicação cancelado pelo usuário.")
 
     root.protocol("WM_DELETE_WINDOW", close_window)
 
@@ -518,6 +797,9 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
         if stop_ui_update or global_should_stop:
             return
         try:
+            # Adaptive UI update frequency: more frequent when cycling, less when idle
+            update_interval = 100 if is_cycling else 500  # 100ms when cycling, 500ms when idle
+            
             while True:
                 data = update_queue.get_nowait()
                 last_routine_run = data.get("last_routine_run")
@@ -560,6 +842,19 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
                 # Update cycle count display
                 update_cycle_display()
                 
+                # Update resource metrics display
+                stats = resource_profiler.get_current_stats()
+                if stats:
+                    cpu_label.config(text=f"CPU: {stats['cpu_avg']:.1f}%")
+                    memory_label.config(text=f"RAM: {stats['memory_current']:.1f} MB")
+                    thread_label.config(text=f"Threads: {stats['thread_count']}")
+                    handle_label.config(text=f"Handles: {stats['handle_count']}")
+                    
+                    # Format uptime
+                    uptime_seconds = int(stats['uptime'])
+                    uptime_str = f"{uptime_seconds//3600}h {(uptime_seconds%3600)//60}m {uptime_seconds%60}s"
+                    uptime_label.config(text=f"Uptime: {uptime_str}")
+                
                 if last_routine_range and is_cycling:
                     start, end = last_routine_range
                     if start > end:
@@ -580,20 +875,29 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
                 else:
                     instance_listbox.insert(tk.END, "Nenhuma VM disponível")
 
+                # Optimize chart updates: only update when there are significant changes
                 if vm_info and vm_info != last_vm_info:
                     running_count = sum(1 for vm in vm_info if vm["status"] == "running")
                     times.append(current_time)
                     running_counts.append(running_count)
-                    ax.clear()
-                    ax.plot(times, running_counts, label="VMs em Execução", color="#2196F3")
-                    ax.set_xlabel("Tempo (s)", color="#212121")
-                    ax.set_ylabel("Número de VMs em Execução", color="#212121")
-                    ax.tick_params(colors="#212121")
-                    ax.grid(color=(0, 0, 0, 0.1))
-                    ax.set_facecolor("#FFFFFF")
-                    fig.patch.set_facecolor("#F5F5F5")
-                    ax.legend(facecolor="#FFFFFF", edgecolor="#212121", labelcolor="#212121")
-                    canvas.draw()
+                    
+                    # Limit chart data points to prevent memory bloat
+                    if len(times) > 100:
+                        times.pop(0)
+                        running_counts.pop(0)
+                    
+                    # Only update chart when cycling or when there are significant changes
+                    if is_cycling or abs(running_count - (running_counts[-2] if len(running_counts) > 1 else 0)) > 0:
+                        ax.clear()
+                        ax.plot(times, running_counts, label="VMs em Execução", color="#2196F3")
+                        ax.set_xlabel("Tempo (s)", color="#212121")
+                        ax.set_ylabel("Número de VMs em Execução", color="#212121")
+                        ax.tick_params(colors="#212121")
+                        ax.grid(color=(0, 0, 0, 0.1))
+                        ax.set_facecolor("#FFFFFF")
+                        fig.patch.set_facecolor("#F5F5F5")
+                        ax.legend(facecolor="#FFFFFF", edgecolor="#212121", labelcolor="#212121")
+                        canvas.draw()
                     last_vm_info = vm_info
 
         except queue.Empty:
@@ -601,7 +905,7 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
         except Exception as e:
             print(f"Erro na atualização da UI: {e}")
         if not stop_ui_update and not global_should_stop:
-            after_id = root.after(50, update_ui)
+            after_id = root.after(update_interval, update_ui)
 
     return root, update_ui, status_label, batch_size, cycle_interval_entry
 
@@ -676,7 +980,10 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
     while not global_should_stop:
         try:
             current_time = time.time()
-            if current_time - last_vm_info_update >= 1:
+            
+            # Adaptive VM info update frequency: more frequent when cycling, less when idle
+            update_interval = 2 if is_cycling else 5  # 2s when cycling, 5s when idle
+            if current_time - last_vm_info_update >= update_interval:
                 vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
                 last_vm_info_update = current_time
 
@@ -699,13 +1006,15 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                     current_index = 0
                     print("Cycle state reset complete")
 
-            update_queue.put({
-                "last_routine_run": last_routine_run,
-                "last_routine_range": last_routine_range,
-                "current_time": current_time,
-                "status": "Em Execução" if is_cycling else "Parado",
-                "vm_info": vm_info
-            })
+            # Only send updates when cycling or when there are changes
+            if is_cycling or current_time - last_vm_info_update < 1:
+                update_queue.put({
+                    "last_routine_run": last_routine_run,
+                    "last_routine_range": last_routine_range,
+                    "current_time": current_time,
+                    "status": "Em Execução" if is_cycling else "Parado",
+                    "vm_info": vm_info
+                })
 
             if is_cycling and (last_routine_run is None or (current_time - last_routine_run) >= current_cycle_interval):
                 print(f"Cycle time reached. Current time: {current_time}, Last run: {last_routine_run}, Interval: {current_cycle_interval}")
@@ -770,7 +1079,9 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                 })
                 print(f"Cycle completed. Next cycle in {current_cycle_interval} seconds")
 
-            time.sleep(0.1)
+            # Adaptive sleep: shorter when cycling, longer when idle
+            sleep_time = 0.5 if is_cycling else 1.0
+            time.sleep(sleep_time)
         except Exception as e:
             print(f"Erro no loop principal: {e}")
             update_queue.put({
