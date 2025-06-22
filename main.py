@@ -1134,20 +1134,16 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                         control_instances(mumu_manager, vms_to_stop, SelectionActions.STOP)
 
                     if is_retry_attempt:
-                        # The retry attempt also failed. Give up and move to the next batch.
-                        print("CRITICAL: Retry failed. Moving to the next batch for the next cycle.")
-                        last_routine_run = time.time() # Reset timer to wait for full interval
+                        # The retry attempt also failed. Give up and move immediately to the next batch.
+                        print("CRITICAL: Retry failed. Moving immediately to the next batch.")
                         current_index = (current_index + batch_size) % len(active_vm_indices)
                         is_retry_attempt = False # Reset for the next batch
-                        print(f"State after failed retry: last_routine_run={last_routine_run}, is_retry_attempt={is_retry_attempt}, next_index will be {current_index}")
+                        # By leaving last_routine_run unchanged, the main loop will immediately attempt the next batch.
+                        print(f"State after failed retry: is_retry_attempt={is_retry_attempt}, next_index will be {current_index}")
                     else:
                         # First failure. Set flag to retry once.
                         print("CRITICAL: No VMs in the batch started or all errored. Will retry same batch once.")
                         is_retry_attempt = True
-                        # By not updating last_routine_run, the next loop will trigger an immediate retry.
-                        print(f"State after first failure: last_routine_run={last_routine_run}, is_retry_attempt={is_retry_attempt}")
-                    
-                    last_routine_range = None # Clear range as it's not running
             
             # Adaptive sleep: shorter when cycling, longer when idle
             sleep_time = 0.5 if is_cycling else 1.0
