@@ -172,13 +172,52 @@ def signal_handler(sig, frame):
     print("\nRecebido Ctrl+C, encerrando graciosamente...")
     global_should_stop = True
 
-def get_vm_info(mumu_base_path):
-    """Get VM information by querying MuMuManager info for indices 0 to 20 in parallel."""
+def discover_vm_range(mumu_manager):
+    """Discover the actual range of VM indices by testing a wider range."""
+    print("Descobrindo range de VMs disponíveis...")
+    valid_indices = []
+    
+    # Test a much wider range to find all VMs
+    test_range = range(100)  # Test up to index 99
+    
+    def test_vm_index(index):
+        try:
+            result = subprocess.run(
+                [mumu_manager, "info", "-v", str(index)],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=3
+            )
+            vm_data = json.loads(result.stdout)
+            if vm_data.get("error_code", -1) == 0:
+                return index
+        except:
+            pass
+        return None
+    
+    # Use threading to speed up discovery
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        future_to_index = {executor.submit(test_vm_index, i): i for i in test_range}
+        for future in as_completed(future_to_index):
+            result = future.result()
+            if result is not None:
+                valid_indices.append(result)
+    
+    valid_indices.sort()
+    print(f"VMs descobertas nos índices: {valid_indices}")
+    return valid_indices
+
+def get_vm_info(mumu_base_path, vm_indices=None):
+    """Get VM information by querying MuMuManager info for discovered indices."""
     start_time = time.time()
     mumu_manager = os.path.join(mumu_base_path, "shell", "MuMuManager.exe")
     vm_info = []
-    indices = range(21)
-
+    
+    # If no indices provided, discover them
+    if vm_indices is None:
+        vm_indices = discover_vm_range(mumu_manager)
+    
     def query_vm(index):
         try:
             result = subprocess.run(
@@ -186,7 +225,7 @@ def get_vm_info(mumu_base_path):
                 capture_output=True,
                 text=True,
                 check=True,
-                timeout=2  # Add timeout to prevent hanging
+                timeout=5  # Increased timeout
             )
             vm_data = json.loads(result.stdout)
             if vm_data.get("error_code", -1) == 0:
@@ -195,7 +234,7 @@ def get_vm_info(mumu_base_path):
                 launch_err_code = vm_data.get("launch_err_code", 0)
                 launch_err_msg = vm_data.get("launch_err_msg", "")
                 has_error = launch_err_code != 0 or bool(launch_err_msg)
-
+                
                 # Status reflects the process state, which is what 'stop' commands target.
                 process_status = "running" if is_process_started else "stopped"
                 
@@ -209,13 +248,14 @@ def get_vm_info(mumu_base_path):
                     "error_message": launch_err_msg,
                 }
             return None
-        except (subprocess.CalledProcessError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        except (subprocess.CalledProcessError, json.JSONDecodeError, subprocess.TimeoutExpired) as e:
+            print(f"Error querying VM {index}: {e}")
             return None
 
     # Use fewer workers when not cycling to reduce resource usage
-    max_workers = 5 if not is_cycling else 10
+    max_workers = 8 if not is_cycling else 15
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_index = {executor.submit(query_vm, i): i for i in indices}
+        future_to_index = {executor.submit(query_vm, i): i for i in vm_indices}
         for future in as_completed(future_to_index):
             result = future.result()
             if result:
@@ -223,11 +263,11 @@ def get_vm_info(mumu_base_path):
 
     vm_info.sort(key=lambda x: x['index'])  # Sort by index for consistent order
     elapsed_time = time.time() - start_time
-    if elapsed_time > 1.0:  # Only print if it takes more than 1 second
-        print(f"Tempo decorrido: {elapsed_time:.2f} segundos")
+    if elapsed_time > 2.0:  # Only print if it takes more than 2 seconds
+        print(f"Tempo decorrido para obter info das VMs: {elapsed_time:.2f} segundos")
     return vm_info if vm_info else []
 
-def padronize_vm_names(vm_name_prefix, mumu_base_path):
+def padronize_vm_names(vm_name_prefix, mumu_base_path, vm_indices=None):
     """Standardize VM names, skipping main VM (index 0)."""
     mumu_manager = os.path.join(mumu_base_path, "shell", "MuMuManager.exe")
     vm_names = []
@@ -241,31 +281,46 @@ def padronize_vm_names(vm_name_prefix, mumu_base_path):
                 used_names.add(name)
                 return name
 
-    vm_info = get_vm_info(mumu_base_path)
+    vm_info = get_vm_info(mumu_base_path, vm_indices)
     if not vm_info:
         print("Aviso: Nenhuma VM válida encontrada. Crie VMs no Gerenciador de Instâncias Múltiplas do MuMu.")
         return vm_names
 
     for vm in vm_info:
         current_name = vm["name"]
+        vm_index = str(vm["index"])  # Convert to string for subprocess
+        
         if vm["is_main"]:
             print(f"Ignorando renomeação para VM principal {vm['index']}: {current_name}")
             vm_names.append(current_name)
             used_names.add(current_name)
             continue
+
         if not current_name.startswith(vm_name_prefix):
             new_name = generate_unique_name()
             try:
-                subprocess.run(
-                    [mumu_manager, "rename", "-v", vm["index"], new_name],
+                # Improved rename command with better error handling
+                result = subprocess.run(
+                    [mumu_manager, "rename", "-v", vm_index, "-n", new_name],
                     capture_output=True,
                     text=True,
-                    check=True
+                    check=True,
+                    timeout=10
                 )
                 vm_names.append(new_name)
-                print(f"Renomeada VM {vm['index']} para {new_name}")
+                print(f"Renomeada VM {vm['index']} de '{current_name}' para '{new_name}'")
+                time.sleep(1)  # Small delay between renames
             except subprocess.CalledProcessError as e:
                 print(f"Erro ao renomear VM {vm['index']}: {e}")
+                print(f"Stdout: {e.stdout}")
+                print(f"Stderr: {e.stderr}")
+                # Keep the original name if rename fails
+                vm_names.append(current_name)
+                used_names.add(current_name)
+            except subprocess.TimeoutExpired:
+                print(f"Timeout ao renomear VM {vm['index']}")
+                vm_names.append(current_name)
+                used_names.add(current_name)
         else:
             vm_names.append(current_name)
             used_names.add(current_name)
@@ -286,20 +341,26 @@ def control_instances(mumu_manager, vm_indices, action):
     
     for idx in vm_indices:
         try:
+            # Convert index to string for subprocess
+            idx_str = str(idx)
             # Add a timeout to prevent hanging
-            subprocess.run(
-                [mumu_manager, "control", action, "-v", str(idx)],
+            result = subprocess.run(
+                [mumu_manager, "control", action, "-v", idx_str],
                 capture_output=True,
                 text=True,
                 check=True,
-                timeout=30
+                timeout=45  # Increased timeout for VM operations
             )
             print(f"Executado com sucesso {action} para VM {idx}")
             successful_indices.append(idx)
-            # wait 1 second
-            time.sleep(1)
+            # Wait between operations to avoid overwhelming the system
+            time.sleep(2)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             print(f"Erro ao executar {action} para VM {idx}: {e}")
+            if hasattr(e, 'stdout') and e.stdout:
+                print(f"Stdout: {e.stdout}")
+            if hasattr(e, 'stderr') and e.stderr:
+                print(f"Stderr: {e.stderr}")
             failed_indices.append(idx)
             
     return successful_indices, failed_indices
@@ -415,6 +476,7 @@ def create_path_config_ui():
     path_entry = tk.Entry(new_path_frame, textvariable=path_var, width=50, font=("Arial", 10))
     path_entry.pack(side=tk.LEFT, padx=5)
     ttk.Button(new_path_frame, text="Confirmar", command=confirm_path).pack(side=tk.LEFT, padx=5)
+
     error_label = tk.Label(main_frame, text="", bg="#F5F5F5", fg="#D32F2F", font=("Arial", 10))
     error_label.pack(anchor="w", pady=5)
 
@@ -427,13 +489,14 @@ def create_path_config_ui():
 
     path_window.protocol("WM_DELETE_WINDOW", on_closing)
     path_window.mainloop()
+
     return result["mumu_base_path"]
 
-def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_thread_container, total_instances):
+def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_thread_container, total_instances, discovered_indices):
     """Create a Tkinter UI with a light mode design, chart, and cycle controls."""
     root = tk.Tk()
     root.title("Gerenciador de Instâncias MuMu")
-    root.geometry("800x600")
+    root.geometry("900x700")  # Increased size to accommodate more VMs
     root.configure(bg="#F5F5F5")  # Light background
 
     style = ttk.Style()
@@ -449,6 +512,14 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
 
     top_frame = tk.Frame(root, bg="#F5F5F5")
     top_frame.pack(pady=10, fill=tk.X, padx=10)
+
+    # VM Discovery Info
+    discovery_frame = tk.Frame(top_frame, bg="#F5F5F5")
+    discovery_frame.pack(anchor="w", pady=5)
+    
+    discovery_label = tk.Label(discovery_frame, text=f"🔍 VMs Descobertas: {len(discovered_indices)} VMs nos índices {discovered_indices}", 
+                              bg="#F5F5F5", fg="#2E7D32", font=("Arial", 10, "bold"))
+    discovery_label.pack(anchor="w")
 
     control_frame = tk.Frame(top_frame, bg="#F5F5F5")
     control_frame.pack(anchor="w", pady=5)
@@ -469,22 +540,28 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
     start_button.pack(side=tk.LEFT, padx=5)
     stop_button = ttk.Button(control_frame, text="Parar Ciclo", state="disabled")
     stop_button.pack(side=tk.LEFT, padx=5)
+
     error_label = tk.Label(control_frame, text="", bg="#F5F5F5", fg="#D32F2F", font=("Arial", 10))
     error_label.pack(side=tk.LEFT, padx=5)
 
     progress_label = tk.Label(top_frame, text="Progresso do Ciclo:", bg="#F5F5F5", fg="#212121", font=("Arial", 12))
     progress_label.pack(anchor="w")
+
     progress_bar = ttk.Progressbar(top_frame, length=400, mode='determinate')
     progress_bar.pack(fill=tk.X, pady=5)
 
     status_label = tk.Label(top_frame, text="Status: Inativo", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
     status_label.pack(anchor="w")
+
     current_batch_label = tk.Label(top_frame, text="Lote Atual: Nenhum", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
     current_batch_label.pack(anchor="w")
+
     last_cycle_label = tk.Label(top_frame, text="Último Ciclo: Nenhum", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
     last_cycle_label.pack(anchor="w")
+
     cycle_count_label = tk.Label(top_frame, text="Ciclos: 0 / 0", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
     cycle_count_label.pack(anchor="w")
+
     time_remaining_label = tk.Label(top_frame, text="Tempo Restante: N/A", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
     time_remaining_label.pack(anchor="w")
 
@@ -536,14 +613,18 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
 
     instance_frame = tk.Frame(bottom_frame, bg="#F5F5F5")
     instance_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    instance_listbox = tk.Listbox(instance_frame, height=10, width=30, bg="#FFFFFF", fg="#212121", font=("Arial", 10))
+
+    # Increased listbox height to show more VMs
+    instance_listbox = tk.Listbox(instance_frame, height=15, width=40, bg="#FFFFFF", fg="#212121", font=("Arial", 9))
     instance_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
     scrollbar = tk.Scrollbar(instance_frame, orient=tk.VERTICAL, command=instance_listbox.yview)
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
     instance_listbox.config(yscrollcommand=scrollbar.set)
 
     chart_frame = tk.Frame(bottom_frame, bg="#F5F5F5")
     chart_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
     fig, ax = plt.subplots(figsize=(4, 3), facecolor="#F5F5F5")
     ax.set_facecolor("#FFFFFF")
     canvas = FigureCanvasTkAgg(fig, master=chart_frame)
@@ -554,6 +635,7 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
     last_vm_info = None
     stop_ui_update = False
     after_id = None
+
     batch_size = tk.IntVar(value=0)  # Create batch_size here
     cycle_count = 0  # Track current session cycles
     total_cycles_needed = 0  # Track total cycles needed to complete all instances
@@ -615,7 +697,7 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
         
         if batch_size_val and cycle_interval_val:
             # Stop all running instances first to ensure clean start
-            running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager))) if vm["status"] == "running" and not vm["is_main"]]
+            running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices) if vm["status"] == "running" and not vm["is_main"]]
             if running_vms:
                 print("Parando todas as instâncias para iniciar novo ciclo...")
                 control_instances(mumu_manager, running_vms, SelectionActions.STOP)
@@ -676,7 +758,7 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
             pass  # Don't fail if validation doesn't pass
         
         # Stop all running instances
-        running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager))) if vm["status"] == "running" and not vm["is_main"]]
+        running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices) if vm["status"] == "running" and not vm["is_main"]]
         if running_vms:
             print("Parando todas as instâncias...")
             control_instances(mumu_manager, running_vms, SelectionActions.STOP)
@@ -767,7 +849,7 @@ Handles Máximos: {peak_stats['handle_peak']}
     # Ensure clean startup state
     def ensure_clean_startup():
         """Ensure no instances are running when the program starts."""
-        running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager))) if vm["status"] == "running" and not vm["is_main"]]
+        running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices) if vm["status"] == "running" and not vm["is_main"]]
         if running_vms:
             print("Limpando instâncias de sessões anteriores...")
             control_instances(mumu_manager, running_vms, SelectionActions.STOP)
@@ -780,19 +862,16 @@ Handles Máximos: {peak_stats['handle_peak']}
     def close_window():
         """Handle window close event with a confirmation dialog."""
         from tkinter import messagebox
-
         title = "Aviso: Ação Crítica"
         message = (
             "Fechar esta janela irá interromper e reiniciar todo o ciclo de automação.\n\n"
             "Esta é uma ação crítica que não deve ser executada durante a operação normal.\n\n"
             "Tem certeza que deseja continuar e encerrar o programa?"
         )
-
         if messagebox.askyesno(title, message, icon='warning'):
             global global_should_stop, is_cycling, resource_profiler
             nonlocal stop_ui_update, after_id
             print("Confirmado. Fechando janela e encerrando programa...")
-
             # Stop profiling and export final data
             if resource_profiler.profiling_active:
                 print("Parando profiling e exportando dados finais...")
@@ -820,6 +899,7 @@ Handles Máximos: {peak_stats['handle_peak']}
         nonlocal last_vm_info, stop_ui_update, after_id, cycle_count, total_cycles_needed
         if stop_ui_update or global_should_stop:
             return
+
         try:
             # Adaptive UI update frequency: more frequent when cycling, less when idle
             update_interval = 100 if is_cycling else 500  # 100ms when cycling, 500ms when idle
@@ -936,6 +1016,7 @@ Handles Máximos: {peak_stats['handle_peak']}
             pass
         except Exception as e:
             print(f"Erro na atualização da UI: {e}")
+
         if not stop_ui_update and not global_should_stop:
             after_id = root.after(update_interval, update_ui)
 
@@ -958,8 +1039,19 @@ def main():
 
     mumu_manager = os.path.join(mumu_base_path, "shell", "MuMuManager.exe")
     vm_base_name = "ROM_"
+
+    print("Descobrindo todas as VMs disponíveis...")
+    # First discover all available VM indices
+    discovered_indices = discover_vm_range(mumu_manager)
+    
+    if not discovered_indices:
+        print("Erro: Nenhuma VM encontrada. Verifique se o MuMu Player está instalado corretamente.")
+        sys.exit(1)
+    
+    print(f"Descobertas {len(discovered_indices)} VMs nos índices: {discovered_indices}")
+
     print("Verificando nomes das VMs...")
-    vm_info = get_vm_info(mumu_base_path)
+    vm_info = get_vm_info(mumu_base_path, discovered_indices)
     active_vm_info = [vm for vm in vm_info if not vm["is_main"]]
     active_vm_indices = sorted([int(vm["index"]) for vm in active_vm_info])
 
@@ -971,7 +1063,7 @@ def main():
     else:
         print("Nenhuma VM não principal em execução encontrada.")
 
-    vm_names = padronize_vm_names(vm_base_name, mumu_base_path)
+    vm_names = padronize_vm_names(vm_base_name, mumu_base_path, discovered_indices)
     print(f"Encontradas {len(vm_names)} VMs: {vm_names}")
     
     if not active_vm_indices:
@@ -979,37 +1071,45 @@ def main():
         sys.exit(1)
 
     time.sleep(5)
-
     total_instances = len(active_vm_indices)
+
     signal.signal(signal.SIGINT, signal_handler)
-
     management_thread_container = []
-    root, update_ui, status_label, batch_size, cycle_interval_entry = create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_thread_container, total_instances)
+
+    root, update_ui, status_label, batch_size, cycle_interval_entry = create_ui(
+        vm_names, cycle_interval, update_queue, mumu_manager, 
+        management_thread_container, total_instances, discovered_indices
+    )
     
-    management_thread = threading.Thread(target=run_management, args=(update_queue, mumu_manager, active_vm_indices, cycle_interval, batch_size))
+    management_thread = threading.Thread(
+        target=run_management, 
+        args=(update_queue, mumu_manager, active_vm_indices, cycle_interval, batch_size, discovered_indices)
+    )
     management_thread_container.append(management_thread)
-
     management_thread.start()
-    update_ui()
 
+    update_ui()
     root.mainloop()
+
     global_should_stop = True
     if management_thread_container and management_thread_container[0].is_alive():
         management_thread_container[0].join(timeout=10.0)
+
     print("Programa encerrado.")
     sys.exit(0)
 
-def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval, batch_size_var=None):
+def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval, batch_size_var=None, discovered_indices=None):
     global global_should_stop, is_cycling
     last_routine_run = None
     last_routine_range = None
     current_cycle_interval = cycle_interval  # Track current cycle interval
-    vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
+    vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
     last_vm_info_update = 0
     current_index = 0  # Track position in active_vm_indices
     is_retry_attempt = False # New state variable for retry logic
 
     print("Iniciando gerenciamento de instâncias...")
+
     while not global_should_stop:
         try:
             current_time = time.time()
@@ -1017,7 +1117,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
             # Adaptive VM info update frequency: more frequent when cycling, less when idle
             update_interval = 2 if is_cycling else 5  # 2s when cycling, 5s when idle
             if current_time - last_vm_info_update >= update_interval:
-                vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
+                vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
                 last_vm_info_update = current_time
 
             # Process queue for control messages
@@ -1053,7 +1153,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                 print(f"Cycle time reached. Current time: {current_time}, Last run: {last_routine_run}, Interval: {current_cycle_interval}")
                 
                 # 1. Stop all currently running instances
-                all_vms_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
+                all_vms_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
                 running_vms = [int(vm["index"]) for vm in all_vms_info if vm["status"] == "running" and not vm["is_main"]]
                 if running_vms:
                     print(f"Stopping running VMs: {running_vms}")
@@ -1084,7 +1184,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                 batch_started_successfully = False
                 
                 while time.time() - start_verification_time < 90: # 90-second verification window
-                    vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
+                    vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
                     
                     # Check for successfully started VMs
                     running_in_batch = [
@@ -1127,7 +1227,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                 else:
                     # The batch failed to start. As a safety measure, ensure all non-main VMs are stopped.
                     print("Ensuring all non-main VMs are stopped after a batch start failure.")
-                    all_vms_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)))
+                    all_vms_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
                     vms_to_stop = [int(vm["index"]) for vm in all_vms_info if vm["status"] == "running" and not vm["is_main"]]
                     if vms_to_stop:
                         print(f"Stopping lingering VMs: {vms_to_stop}")
@@ -1148,6 +1248,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
             # Adaptive sleep: shorter when cycling, longer when idle
             sleep_time = 0.5 if is_cycling else 1.0
             time.sleep(sleep_time)
+
         except Exception as e:
             print(f"Erro no loop principal: {e}")
             update_queue.put({
@@ -1167,6 +1268,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
         "status": "Desligando",
         "vm_info": vm_info
     })
+
     try:
         running_vms = [int(vm["index"]) for vm in vm_info if vm["status"] == "running" and not vm["is_main"]]
         if running_vms:
