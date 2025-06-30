@@ -489,7 +489,6 @@ def create_path_config_ui():
 
     path_window.protocol("WM_DELETE_WINDOW", on_closing)
     path_window.mainloop()
-
     return result["mumu_base_path"]
 
 def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_thread_container, total_instances, discovered_indices):
@@ -721,6 +720,7 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
             # Clear queue to avoid stale data
             while not update_queue.empty():
                 update_queue.get()
+
             # Always send the latest interval and batch size
             update_queue.put({
                 "reset_index": True, 
@@ -872,6 +872,7 @@ Handles Máximos: {peak_stats['handle_peak']}
             global global_should_stop, is_cycling, resource_profiler
             nonlocal stop_ui_update, after_id
             print("Confirmado. Fechando janela e encerrando programa...")
+
             # Stop profiling and export final data
             if resource_profiler.profiling_active:
                 print("Parando profiling e exportando dados finais...")
@@ -1010,6 +1011,7 @@ Handles Máximos: {peak_stats['handle_peak']}
                         fig.patch.set_facecolor("#F5F5F5")
                         ax.legend(facecolor="#FFFFFF", edgecolor="#212121", labelcolor="#212121")
                         canvas.draw()
+
                     last_vm_info = vm_info
 
         except queue.Empty:
@@ -1074,6 +1076,7 @@ def main():
     total_instances = len(active_vm_indices)
 
     signal.signal(signal.SIGINT, signal_handler)
+
     management_thread_container = []
 
     root, update_ui, status_label, batch_size, cycle_interval_entry = create_ui(
@@ -1100,6 +1103,7 @@ def main():
 
 def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval, batch_size_var=None, discovered_indices=None):
     global global_should_stop, is_cycling
+
     last_routine_run = None
     last_routine_range = None
     current_cycle_interval = cycle_interval  # Track current cycle interval
@@ -1107,6 +1111,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
     last_vm_info_update = 0
     current_index = 0  # Track position in active_vm_indices
     is_retry_attempt = False # New state variable for retry logic
+    batch_start_time = None  # NEW: Track when current batch was started
 
     print("Iniciando gerenciamento de instâncias...")
 
@@ -1128,6 +1133,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                 if "last_routine_run" in data and data["last_routine_run"] is None:
                     last_routine_run = None
                     last_routine_range = None
+                    batch_start_time = None  # NEW: Reset batch start time
                 # Update cycle interval if provided
                 if "cycle_interval" in data:
                     current_cycle_interval = data["cycle_interval"]
@@ -1137,20 +1143,25 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                     last_routine_run = None
                     last_routine_range = None
                     current_index = 0
+                    batch_start_time = None  # NEW: Reset batch start time
                     print("Cycle state reset complete")
 
             # Only send updates when cycling or when there are changes
             if is_cycling or current_time - last_vm_info_update < 1:
                 update_queue.put({
-                    "last_routine_run": last_routine_run,
+                    "last_routine_run": batch_start_time,  # CHANGED: Use batch_start_time for progress calculation
                     "last_routine_range": last_routine_range,
                     "current_time": current_time,
                     "status": "Em Execução" if is_cycling else "Parado",
                     "vm_info": vm_info
                 })
 
-            if is_cycling and (last_routine_run is None or (current_time - last_routine_run) >= current_cycle_interval):
-                print(f"Cycle time reached. Current time: {current_time}, Last run: {last_routine_run}, Interval: {current_cycle_interval}")
+            # FIXED: Check if it's time to start a new cycle
+            if is_cycling and (batch_start_time is None or (current_time - batch_start_time) >= current_cycle_interval):
+                if batch_start_time is not None:
+                    print(f"Cycle time reached. Current time: {current_time}, Batch started: {batch_start_time}, Interval: {current_cycle_interval}")
+                else:
+                    print(f"Starting first cycle. Current time: {current_time}, Interval: {current_cycle_interval}")
                 
                 # 1. Stop all currently running instances
                 all_vms_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
@@ -1210,8 +1221,8 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
 
                 # 5. Update state only if batch start was successful
                 if batch_started_successfully:
-                    print("Batch start confirmed. Resetting cycle timer.")
-                    last_routine_run = time.time() # Use current time after verification
+                    print("Batch start confirmed. Setting batch timer.")
+                    batch_start_time = time.time()  # NEW: Set batch start time for interval tracking
                     current_index = (current_index + batch_size) % len(active_vm_indices)
                     is_retry_attempt = False # Reset retry flag on success
                     
@@ -1221,9 +1232,9 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                     
                     update_queue.put({
                         "cycle_completed": True,
-                        "current_time": last_routine_run
+                        "current_time": batch_start_time
                     })
-                    print(f"Cycle completed. Next cycle in {current_cycle_interval} seconds")
+                    print(f"Batch running. Next cycle in {current_cycle_interval} seconds")
                 else:
                     # The batch failed to start. As a safety measure, ensure all non-main VMs are stopped.
                     print("Ensuring all non-main VMs are stopped after a batch start failure.")
@@ -1238,12 +1249,13 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                         print("CRITICAL: Retry failed. Moving immediately to the next batch.")
                         current_index = (current_index + batch_size) % len(active_vm_indices)
                         is_retry_attempt = False # Reset for the next batch
-                        # By leaving last_routine_run unchanged, the main loop will immediately attempt the next batch.
+                        batch_start_time = None  # NEW: Reset batch start time to trigger immediate next cycle
                         print(f"State after failed retry: is_retry_attempt={is_retry_attempt}, next_index will be {current_index}")
                     else:
                         # First failure. Set flag to retry once.
                         print("CRITICAL: No VMs in the batch started or all errored. Will retry same batch once.")
                         is_retry_attempt = True
+                        batch_start_time = None  # NEW: Reset batch start time to trigger immediate retry
             
             # Adaptive sleep: shorter when cycling, longer when idle
             sleep_time = 0.5 if is_cycling else 1.0
@@ -1252,7 +1264,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
         except Exception as e:
             print(f"Erro no loop principal: {e}")
             update_queue.put({
-                "last_routine_run": last_routine_run,
+                "last_routine_run": batch_start_time,  # CHANGED: Use batch_start_time
                 "last_routine_range": last_routine_range,
                 "current_time": current_time,
                 "status": f"Erro - {str(e)}",
@@ -1262,7 +1274,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
 
     print("Limpando...")
     update_queue.put({
-        "last_routine_run": last_routine_run,
+        "last_routine_run": batch_start_time,  # CHANGED: Use batch_start_time
         "last_routine_range": last_routine_range,
         "current_time": time.time(),
         "status": "Desligando",
