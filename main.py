@@ -1106,15 +1106,84 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
 
     last_routine_run = None
     last_routine_range = None
-    current_cycle_interval = cycle_interval  # Track current cycle interval
+    current_cycle_interval = cycle_interval  # Use the passed cycle_interval as initial value
     vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
     last_vm_info_update = 0
     current_index = 0  # Track position in active_vm_indices
     is_retry_attempt = False # New state variable for retry logic
     batch_start_time = None  # NEW: Track when current batch was started
+    configuration_received = False  # NEW: Track if we've received initial config
 
-    print("Iniciando gerenciamento de instâncias...")
+    print(f"Iniciando gerenciamento de instâncias... Initial interval: {current_cycle_interval}s")
 
+    # Wait for initial configuration from UI before starting any cycles
+    while not global_should_stop and not configuration_received and not is_cycling:
+        try:
+            current_time = time.time()
+        
+            # Process queue for initial configuration
+            queue_messages = []
+            while not update_queue.empty():
+                try:
+                    data = update_queue.get_nowait()
+                    queue_messages.append(data)
+                except:
+                    break
+
+            # Process all messages in order
+            for data in queue_messages:
+                if data.get("reset_index"):
+                    current_index = 0
+                if "last_routine_run" in data and data["last_routine_run"] is None:
+                    last_routine_run = None
+                    last_routine_range = None
+                    batch_start_time = None
+                # Update cycle interval if provided - PRIORITY UPDATE
+                if "cycle_interval" in data:
+                    current_cycle_interval = data["cycle_interval"]
+                    print(f"✓ Cycle interval updated to: {current_cycle_interval} seconds")
+                    configuration_received = True  # Mark that we've received config
+                # Handle complete reset
+                if data.get("reset_cycle"):
+                    last_routine_run = None
+                    last_routine_range = None
+                    current_index = 0
+                    batch_start_time = None
+                    configuration_received = True  # Mark that we've received config
+                    print("Cycle state reset complete")
+
+            # Update VM info periodically while waiting
+            if current_time - last_vm_info_update >= 5:
+                vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
+                last_vm_info_update = current_time
+            
+            # Send status update
+            update_queue.put({
+                "last_routine_run": None,
+                "last_routine_range": None,
+                "current_time": current_time,
+                "status": "Aguardando configuração" if not configuration_received else "Parado",
+                "vm_info": vm_info
+            })
+
+            # Exit immediately if cycling starts
+            if is_cycling:
+                configuration_received = True
+                print("Cycling started, exiting configuration wait")
+                break
+
+            time.sleep(1)  # Wait for configuration
+        
+        except Exception as e:
+            print(f"Erro aguardando configuração: {e}")
+            time.sleep(1)
+
+    if global_should_stop:
+        return
+
+    print(f"Configuration received. Starting management with interval: {current_cycle_interval}s")
+
+    # Main management loop
     while not global_should_stop:
         try:
             current_time = time.time()
@@ -1125,19 +1194,27 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                 vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
                 last_vm_info_update = current_time
 
-            # Process queue for control messages
+            # Process queue for control messages - PROCESS ALL MESSAGES FIRST
+            queue_messages = []
             while not update_queue.empty():
-                data = update_queue.get_nowait()
+                try:
+                    data = update_queue.get_nowait()
+                    queue_messages.append(data)
+                except:
+                    break
+
+            # Process all messages in order
+            for data in queue_messages:
                 if data.get("reset_index"):
                     current_index = 0
                 if "last_routine_run" in data and data["last_routine_run"] is None:
                     last_routine_run = None
                     last_routine_range = None
                     batch_start_time = None  # NEW: Reset batch start time
-                # Update cycle interval if provided
+                # Update cycle interval if provided - PRIORITY UPDATE
                 if "cycle_interval" in data:
                     current_cycle_interval = data["cycle_interval"]
-                    print(f"Cycle interval updated to: {current_cycle_interval} seconds")
+                    print(f"✓ Cycle interval updated to: {current_cycle_interval} seconds")
                 # Handle complete reset
                 if data.get("reset_cycle"):
                     last_routine_run = None
@@ -1159,9 +1236,10 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
             # FIXED: Check if it's time to start a new cycle
             if is_cycling and (batch_start_time is None or (current_time - batch_start_time) >= current_cycle_interval):
                 if batch_start_time is not None:
-                    print(f"Cycle time reached. Current time: {current_time}, Batch started: {batch_start_time}, Interval: {current_cycle_interval}")
+                    elapsed = current_time - batch_start_time
+                    print(f"Cycle time reached. Current time: {current_time}, Batch started: {batch_start_time}, Elapsed: {elapsed:.1f}s, Required: {current_cycle_interval}s")
                 else:
-                    print(f"Starting first cycle. Current time: {current_time}, Interval: {current_cycle_interval}")
+                    print(f"Starting first cycle. Current time: {current_time}, Interval: {current_cycle_interval}s")
                 
                 # 1. Stop all currently running instances
                 all_vms_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
