@@ -166,15 +166,60 @@ class SelectionActions:
 global_should_stop = False
 is_cycling = False
 
+def find_mumu_manager_exe(mumu_base_path):
+    """
+    Find the correct path to MuMuManager.exe based on the folder structure.
+    Supports both old (shell/) and new (nx_main/) folder structures.
+    
+    MuMu Player folder architecture evolution:
+    - Old versions: D:/Program Files/Netease/MuMuPlayer-12.0/shell/MuMuManager.exe
+    - New versions: D:/Program Files/Netease/MuMuPlayerGlobal-12.0/nx_main/MuMuManager.exe
+    """
+    # Try new structure first (MuMuPlayerGlobal-12.0+)
+    new_path = os.path.join(mumu_base_path, "nx_main", "MuMuManager.exe")
+    if os.path.exists(new_path):
+        print(f"✓ Found MuMuManager.exe in new structure: {new_path}")
+        return new_path
+    
+    # Try old structure (shell/)
+    old_path = os.path.join(mumu_base_path, "shell", "MuMuManager.exe")
+    if os.path.exists(old_path):
+        print(f"✓ Found MuMuManager.exe in old structure: {old_path}")
+        return old_path
+    
+    # If neither found, return None
+    print(f"❌ MuMuManager.exe not found in either nx_main/ or shell/ directories under {mumu_base_path}")
+    return None
+
+def get_mumu_base_path_from_manager(mumu_manager_path):
+    """
+    Extract the base MuMu path from the manager executable path.
+    Works with both old (shell/) and new (nx_main/) structures.
+    """
+    if "nx_main" in mumu_manager_path:
+        # New structure: remove /nx_main/MuMuManager.exe
+        return os.path.dirname(os.path.dirname(mumu_manager_path))
+    elif "shell" in mumu_manager_path:
+        # Old structure: remove /shell/MuMuManager.exe
+        return os.path.dirname(os.path.dirname(mumu_manager_path))
+    else:
+        # Fallback: assume it's in the base directory
+        return os.path.dirname(mumu_manager_path)
+
 def signal_handler(sig, frame):
     """Handle Ctrl+C and other termination signals."""
     global global_should_stop
     print("\nRecebido Ctrl+C, encerrando graciosamente...")
     global_should_stop = True
 
-def discover_vm_range(mumu_manager):
+def discover_vm_range(mumu_base_path):
     """Discover the actual range of VM indices by testing a wider range."""
     print("Descobrindo range de VMs disponíveis...")
+    mumu_manager = find_mumu_manager_exe(mumu_base_path)
+    if not mumu_manager:
+        print("Erro: MuMuManager.exe não encontrado!")
+        return []
+    
     valid_indices = []
     
     # Test a much wider range to find all VMs
@@ -211,7 +256,11 @@ def discover_vm_range(mumu_manager):
 def get_vm_info(mumu_base_path, vm_indices=None):
     """Get VM information by querying MuMuManager info for discovered indices."""
     start_time = time.time()
-    mumu_manager = os.path.join(mumu_base_path, "shell", "MuMuManager.exe")
+    mumu_manager = find_mumu_manager_exe(mumu_base_path)
+    if not mumu_manager:
+        print("Erro: MuMuManager.exe não encontrado!")
+        return []
+    
     vm_info = []
     
     # If no indices provided, discover them
@@ -269,7 +318,11 @@ def get_vm_info(mumu_base_path, vm_indices=None):
 
 def padronize_vm_names(vm_name_prefix, mumu_base_path, vm_indices=None):
     """Standardize VM names, skipping main VM (index 0)."""
-    mumu_manager = os.path.join(mumu_base_path, "shell", "MuMuManager.exe")
+    mumu_manager = find_mumu_manager_exe(mumu_base_path)
+    if not mumu_manager:
+        print("Erro: MuMuManager.exe não encontrado!")
+        return []
+    
     vm_names = []
     used_names = set()
 
@@ -418,7 +471,7 @@ def create_path_config_ui():
         with open(last_path_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         prev_path = data.get("mumu_base_path", "").strip()
-        if not (prev_path and os.path.isdir(prev_path) and os.path.exists(os.path.join(prev_path, "shell", "MuMuManager.exe"))):
+        if not (prev_path and os.path.isdir(prev_path) and find_mumu_manager_exe(prev_path)):
             prev_path = ""
     except Exception:
         prev_path = ""
@@ -432,8 +485,8 @@ def create_path_config_ui():
     def validate_path(path):
         if not path or not os.path.isdir(path):
             return False
-        mumu_manager = os.path.join(path, "shell", "MuMuManager.exe")
-        return os.path.exists(mumu_manager)
+        mumu_manager = find_mumu_manager_exe(path)
+        return mumu_manager is not None
 
     def reuse_path():
         if validate_path(prev_path):
@@ -468,10 +521,12 @@ def create_path_config_ui():
         button_frame.pack(anchor="w", pady=5)
         ttk.Button(button_frame, text="Reutilizar", command=reuse_path).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Mudar Caminho", command=lambda: [prev_path_label.pack_forget(), button_frame.pack_forget(), new_path_frame.pack(anchor="w", pady=5)]).pack(side=tk.LEFT, padx=5)
-    else:
-        tk.Label(main_frame, text="Digite o caminho de instalação do MuMu (ex.: D:\\Program Files\\Netease\\MuMuPlayerGlobal-12.0):", bg="#F5F5F5", fg="#212121", font=("Arial", 10)).pack(anchor="w", pady=5)
+    if not prev_path:
+        tk.Label(main_frame, text="Digite o caminho de instalação do MuMu:", bg="#F5F5F5", fg="#212121", font=("Arial", 10, "bold")).pack(anchor="w", pady=5)
+        tk.Label(main_frame, text="Exemplo: D:\\Program Files\\Netease\\MuMuPlayerGlobal-12.0", bg="#F5F5F5", fg="#616161", font=("Arial", 9)).pack(anchor="w", pady=(0,5))
+        tk.Label(main_frame, text="(Suporta tanto nx_main/ quanto shell/ automaticamente)", bg="#F5F5F5", fg="#616161", font=("Arial", 8)).pack(anchor="w", pady=(0,5))
 
-    prev_path_label = tk.Label(main_frame, text="Digite o caminho de instalação do MuMu (ex.: D:\\Program Files\\Netease\\MuMuPlayerGlobal-12.0):", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
+    prev_path_label = tk.Label(main_frame, text="Digite o caminho de instalação do MuMu:", bg="#F5F5F5", fg="#212121", font=("Arial", 10))
     new_path_frame = tk.Frame(main_frame, bg="#F5F5F5")
     path_entry = tk.Entry(new_path_frame, textvariable=path_var, width=50, font=("Arial", 10))
     path_entry.pack(side=tk.LEFT, padx=5)
@@ -696,7 +751,7 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
         
         if batch_size_val and cycle_interval_val:
             # Stop all running instances first to ensure clean start
-            running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices) if vm["status"] == "running" and not vm["is_main"]]
+            running_vms = [int(vm["index"]) for vm in get_vm_info(get_mumu_base_path_from_manager(mumu_manager), discovered_indices) if vm["status"] == "running" and not vm["is_main"]]
             if running_vms:
                 print("Parando todas as instâncias para iniciar novo ciclo...")
                 control_instances(mumu_manager, running_vms, SelectionActions.STOP)
@@ -758,7 +813,7 @@ def create_ui(vm_names, cycle_interval, update_queue, mumu_manager, management_t
             pass  # Don't fail if validation doesn't pass
         
         # Stop all running instances
-        running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices) if vm["status"] == "running" and not vm["is_main"]]
+        running_vms = [int(vm["index"]) for vm in get_vm_info(get_mumu_base_path_from_manager(mumu_manager), discovered_indices) if vm["status"] == "running" and not vm["is_main"]]
         if running_vms:
             print("Parando todas as instâncias...")
             control_instances(mumu_manager, running_vms, SelectionActions.STOP)
@@ -849,7 +904,7 @@ Handles Máximos: {peak_stats['handle_peak']}
     # Ensure clean startup state
     def ensure_clean_startup():
         """Ensure no instances are running when the program starts."""
-        running_vms = [int(vm["index"]) for vm in get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices) if vm["status"] == "running" and not vm["is_main"]]
+        running_vms = [int(vm["index"]) for vm in get_vm_info(get_mumu_base_path_from_manager(mumu_manager), discovered_indices) if vm["status"] == "running" and not vm["is_main"]]
         if running_vms:
             print("Limpando instâncias de sessões anteriores...")
             control_instances(mumu_manager, running_vms, SelectionActions.STOP)
@@ -1039,12 +1094,16 @@ def main():
         print("Nenhum caminho fornecido. Encerrando.")
         sys.exit(1)
 
-    mumu_manager = os.path.join(mumu_base_path, "shell", "MuMuManager.exe")
+    mumu_manager = find_mumu_manager_exe(mumu_base_path)
+    if not mumu_manager:
+        print("Erro: MuMuManager.exe não encontrado! Verifique se o caminho está correto e se o MuMu Player está instalado.")
+        sys.exit(1)
+    
     vm_base_name = "ROM_"
 
     print("Descobrindo todas as VMs disponíveis...")
     # First discover all available VM indices
-    discovered_indices = discover_vm_range(mumu_manager)
+    discovered_indices = discover_vm_range(mumu_base_path)
     
     if not discovered_indices:
         print("Erro: Nenhuma VM encontrada. Verifique se o MuMu Player está instalado corretamente.")
@@ -1107,7 +1166,8 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
     last_routine_run = None
     last_routine_range = None
     current_cycle_interval = cycle_interval  # Use the passed cycle_interval as initial value
-    vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
+    mumu_base_path = get_mumu_base_path_from_manager(mumu_manager)
+    vm_info = get_vm_info(mumu_base_path, discovered_indices)
     last_vm_info_update = 0
     current_index = 0  # Track position in active_vm_indices
     is_retry_attempt = False # New state variable for retry logic
@@ -1154,7 +1214,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
 
             # Update VM info periodically while waiting
             if current_time - last_vm_info_update >= 5:
-                vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
+                vm_info = get_vm_info(mumu_base_path, discovered_indices)
                 last_vm_info_update = current_time
             
             # Send status update
@@ -1191,7 +1251,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
             # Adaptive VM info update frequency: more frequent when cycling, less when idle
             update_interval = 2 if is_cycling else 5  # 2s when cycling, 5s when idle
             if current_time - last_vm_info_update >= update_interval:
-                vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
+                vm_info = get_vm_info(mumu_base_path, discovered_indices)
                 last_vm_info_update = current_time
 
             # Process queue for control messages - PROCESS ALL MESSAGES FIRST
@@ -1242,7 +1302,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                     print(f"Starting first cycle. Current time: {current_time}, Interval: {current_cycle_interval}s")
                 
                 # 1. Stop all currently running instances
-                all_vms_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
+                all_vms_info = get_vm_info(mumu_base_path, discovered_indices)
                 running_vms = [int(vm["index"]) for vm in all_vms_info if vm["status"] == "running" and not vm["is_main"]]
                 if running_vms:
                     print(f"Stopping running VMs: {running_vms}")
@@ -1273,7 +1333,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                 batch_started_successfully = False
                 
                 while time.time() - start_verification_time < 90: # 90-second verification window
-                    vm_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
+                    vm_info = get_vm_info(mumu_base_path, discovered_indices)
                     
                     # Check for successfully started VMs
                     running_in_batch = [
@@ -1316,7 +1376,7 @@ def run_management(update_queue, mumu_manager, active_vm_indices, cycle_interval
                 else:
                     # The batch failed to start. As a safety measure, ensure all non-main VMs are stopped.
                     print("Ensuring all non-main VMs are stopped after a batch start failure.")
-                    all_vms_info = get_vm_info(os.path.dirname(os.path.dirname(mumu_manager)), discovered_indices)
+                    all_vms_info = get_vm_info(mumu_base_path, discovered_indices)
                     vms_to_stop = [int(vm["index"]) for vm in all_vms_info if vm["status"] == "running" and not vm["is_main"]]
                     if vms_to_stop:
                         print(f"Stopping lingering VMs: {vms_to_stop}")
