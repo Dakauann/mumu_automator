@@ -222,8 +222,8 @@ def discover_vm_range(mumu_base_path):
     
     valid_indices = []
     
-    # Test a much wider range to find all VMs
-    test_range = range(100)  # Test up to index 99
+    # Test a reasonable range to find all VMs
+    test_range = range(120)  # Test up to index 49, should be enough for most users
     
     def test_vm_index(index):
         try:
@@ -232,13 +232,16 @@ def discover_vm_range(mumu_base_path):
                 capture_output=True,
                 text=True,
                 check=True,
-                timeout=5 
+                timeout=5  # Reduced timeout for speed
             )
             vm_data = json.loads(result.stdout)
             if vm_data.get("error_code", -1) == 0:
-                print(f"✓ Found VM at index {index}: {vm_data.get('name', 'Unknown')}")
-                return index
-        except subprocess.CalledProcessError as e:
+                return {
+                    'index': index,
+                    'name': vm_data.get('name', 'Unknown'),
+                    'is_main': vm_data.get('is_main', False)
+                }
+        except subprocess.CalledProcessError:
             # MuMu returns error code for non-existent VMs, this is expected
             pass
         except subprocess.TimeoutExpired:
@@ -249,17 +252,20 @@ def discover_vm_range(mumu_base_path):
             print(f"⚠ Unexpected error testing VM {index}: {e}")
         return None
     
-    # Use sequential approach for more reliable discovery
-    print("Testing VM indices sequentially for reliability...")
-    for index in test_range:
-        result = test_vm_index(index)
-        if result is not None:
-            valid_indices.append(result)
-        
-        # Stop testing if we find a large gap (10+ consecutive failures)
-        if len(valid_indices) > 0 and index - max(valid_indices) > 10:
-            print(f"Stopping discovery after large gap at index {index}")
-            break
+    # Use threading for speed with controlled concurrency
+    print("Testing VM indices with threading for speed...")
+    with ThreadPoolExecutor(max_workers=8) as executor:  # Reduced workers to avoid overwhelming MuMu
+        future_to_index = {executor.submit(test_vm_index, i): i for i in test_range}
+        for future in as_completed(future_to_index):
+            try:
+                result = future.result(timeout=5)  # Additional timeout safety
+                if result is not None:
+                    valid_indices.append(result['index'])
+                    main_indicator = " (principal)" if result['is_main'] else ""
+                    print(f"✓ Found VM at index {result['index']}: {result['name']}{main_indicator}")
+            except Exception as e:
+                index = future_to_index[future]
+                print(f"⚠ Error processing VM {index}: {e}")
     
     valid_indices.sort()
     print(f"VMs descobertas nos índices: {valid_indices}")
