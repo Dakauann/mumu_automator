@@ -232,22 +232,34 @@ def discover_vm_range(mumu_base_path):
                 capture_output=True,
                 text=True,
                 check=True,
-                timeout=3
+                timeout=5 
             )
             vm_data = json.loads(result.stdout)
             if vm_data.get("error_code", -1) == 0:
+                print(f"✓ Found VM at index {index}: {vm_data.get('name', 'Unknown')}")
                 return index
-        except:
+        except subprocess.CalledProcessError as e:
+            # MuMu returns error code for non-existent VMs, this is expected
             pass
+        except subprocess.TimeoutExpired:
+            print(f"⚠ Timeout testing VM index {index}")
+        except json.JSONDecodeError as e:
+            print(f"⚠ JSON decode error for VM {index}: {e}")
+        except Exception as e:
+            print(f"⚠ Unexpected error testing VM {index}: {e}")
         return None
     
-    # Use threading to speed up discovery
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_index = {executor.submit(test_vm_index, i): i for i in test_range}
-        for future in as_completed(future_to_index):
-            result = future.result()
-            if result is not None:
-                valid_indices.append(result)
+    # Use sequential approach for more reliable discovery
+    print("Testing VM indices sequentially for reliability...")
+    for index in test_range:
+        result = test_vm_index(index)
+        if result is not None:
+            valid_indices.append(result)
+        
+        # Stop testing if we find a large gap (10+ consecutive failures)
+        if len(valid_indices) > 0 and index - max(valid_indices) > 10:
+            print(f"Stopping discovery after large gap at index {index}")
+            break
     
     valid_indices.sort()
     print(f"VMs descobertas nos índices: {valid_indices}")
